@@ -33,6 +33,16 @@ MODEL_CANDIDATES = [
 ]
 OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY', '').strip().strip('"').strip("'")
 OPENROUTER_MODEL = os.getenv('OPENROUTER_MODEL', 'openai/gpt-4o-mini').strip()
+GROQ_API_KEY = os.getenv('GROQ_API_KEY', '').strip().strip('"').strip("'")
+GROQ_MODEL = os.getenv('GROQ_MODEL', 'llama-3.1-70b-versatile').strip()
+GROQ_MODELS = [
+    m.strip()
+    for m in os.getenv(
+        'GROQ_MODELS',
+        f'{GROQ_MODEL},llama-3.3-70b-versatile,openai/gpt-oss-120b,openai/gpt-oss-20b',
+    ).split(',')
+    if m.strip()
+]
 STRICT_CUTE_FALLBACK = os.getenv('STRICT_CUTE_FALLBACK', 'false').strip().lower() in {'1', 'true', 'yes', 'on'}
 FAST_MODE = os.getenv('FAST_MODE', 'true').strip().lower() in {'1', 'true', 'yes', 'on'}
 CHAT_MAX_OUTPUT_TOKENS = int(os.getenv('CHAT_MAX_OUTPUT_TOKENS', '120'))
@@ -355,6 +365,55 @@ def call_openrouter(system_instruction: str, user_content: str, temperature: flo
         return ''
 
 
+def call_groq(system_instruction: str, user_content: str, temperature: float, max_output_tokens: int) -> str:
+    if not GROQ_API_KEY:
+        return ''
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    timeout = 8 if FAST_MODE else 35
+    for model in GROQ_MODELS:
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_instruction},
+                {"role": "user", "content": user_content},
+            ],
+            "temperature": temperature,
+            "max_tokens": max_output_tokens,
+        }
+        try:
+            resp = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=timeout,
+            )
+            if resp.status_code >= 400:
+                body = resp.text[:300]
+                logger.warning("Groq call failed (%s): %s %s", model, resp.status_code, body)
+                # Skip retired/invalid models and continue trying next configured Groq model.
+                if "model_decommissioned" in body or "no longer supported" in body:
+                    continue
+                if resp.status_code in {400, 404}:
+                    continue
+                return ''
+            data = resp.json()
+            content = (
+                data.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+                .strip()
+            )
+            if content:
+                return content
+        except Exception as exc:
+            logger.warning("Groq request error (%s): %s", model, exc)
+            continue
+    return ''
+
+
 def generate_with_fallback(prompt: str) -> tuple[str, str]:
     now = now_ts()
 
@@ -415,12 +474,20 @@ def generate_with_fallback(prompt: str) -> tuple[str, str]:
         text = call_openrouter(BASE_SYSTEM_INSTRUCTION, prompt, temperature=0.9, max_output_tokens=CHAT_MAX_OUTPUT_TOKENS)
         if text:
             return text, f'openrouter:{OPENROUTER_MODEL}'
+        # Try Groq before returning cooldown if available.
+        text = call_groq(BASE_SYSTEM_INSTRUCTION, prompt, temperature=0.9, max_output_tokens=CHAT_MAX_OUTPUT_TOKENS)
+        if text:
+            return text, f'groq:{GROQ_MODEL}'
         raise RuntimeError(f'models_cooldown:{wait}')
 
     # Gemini attempts failed; try OpenRouter fallback if configured.
     text = call_openrouter(BASE_SYSTEM_INSTRUCTION, prompt, temperature=0.9, max_output_tokens=CHAT_MAX_OUTPUT_TOKENS)
     if text:
         return text, f'openrouter:{OPENROUTER_MODEL}'
+    # Try Groq fallback if configured.
+    text = call_groq(BASE_SYSTEM_INSTRUCTION, prompt, temperature=0.9, max_output_tokens=CHAT_MAX_OUTPUT_TOKENS)
+    if text:
+        return text, f'groq:{GROQ_MODEL}'
     raise RuntimeError(last_error or 'all_models_failed')
 
 
@@ -482,11 +549,17 @@ def generate_task_with_fallback(
         text = call_openrouter(system_instruction, task_text, temperature=temperature, max_output_tokens=min(max_output_tokens, TASK_MAX_OUTPUT_TOKENS))
         if text:
             return text, f'openrouter:{OPENROUTER_MODEL}'
+        text = call_groq(system_instruction, task_text, temperature=temperature, max_output_tokens=min(max_output_tokens, TASK_MAX_OUTPUT_TOKENS))
+        if text:
+            return text, f'groq:{GROQ_MODEL}'
         raise RuntimeError(f'models_cooldown:{wait}')
 
     text = call_openrouter(system_instruction, task_text, temperature=temperature, max_output_tokens=min(max_output_tokens, TASK_MAX_OUTPUT_TOKENS))
     if text:
         return text, f'openrouter:{OPENROUTER_MODEL}'
+    text = call_groq(system_instruction, task_text, temperature=temperature, max_output_tokens=min(max_output_tokens, TASK_MAX_OUTPUT_TOKENS))
+    if text:
+        return text, f'groq:{GROQ_MODEL}'
     raise RuntimeError(last_error or 'all_models_failed')
 
 
