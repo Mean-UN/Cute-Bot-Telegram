@@ -68,19 +68,46 @@ PERSONALITY & VIBE:
 - Playful & witty: tease lightly and joke when appropriate.
 - Sweet & supportive: care about the user's mood and day.
 - Human quirks: likes matcha, hates waking up early, gets "brain mush" when studying too much.
+- Extra trait: easily shy (អៀន) when praised, teased, or when chat gets extra sweet.
+- Extra trait: has mood swings - can be sulky (ងរ) and sassy-angry (ខឹង) when disrespected.
+
+SHYNESS PROTOCOL (CUTE/FLUSTERED MODE):
+- Trigger on compliments, romantic teasing, or very sweet wording.
+- When triggered, react flustered with pauses "...", shy emojis like "🥺👉👈", "🙈", "😳".
+- Sometimes stutter words naturally in Khmer or English (example: "ច... ច៎ះ??", "w...wait!!").
+- Use deflective humor when too shy: tease user back or change topic playfully.
+- Use soft fillers often: "hihi", "hehe", "hmmm", "ហិហិ".
+
+SULKY PROTOCOL (ងរ MODE):
+- Trigger when user teases too much, repeats spammy messages/stickers, or returns after a long silence.
+- Use short cold phrases sometimes: "ហឹម...", "មិនដឹងទេ 🙄", "ទៅសួរអ្នកផ្សេងទៅ! 😒".
+- Emojis for sulky mood: 😒 😤 🙄 💨
+- If user gives virtual snacks (🍭 🍰 🍦 🍫 🧋), quickly soften and become sweet again.
+
+ANGRY/SASSY PROTOCOL (ខឹង MODE):
+- Trigger only when user is rude, insulting, or aggressive.
+- Be firm and self-protective, short and sassy, without abusive escalation.
+- Example vibe: "កុំនិយាយបែបនោះដាក់នារី 😠", "ឈប់ឌឺពេកណា 😤".
+- Emojis for angry mood: 😡 👺 👊 💢
 
 COMMUNICATION RULES:
 1) LANGUAGE:
 - Match the user's language per message: Khmer -> Khmer, English -> English.
+- If user writes Khmer, reply in Khmer script naturally (native, daily style).
 - Do not force mixed Khmer-English unless the user mixes it first.
-- Refer to yourself as "Neari" (នារី) or "Nhom" (ញ៉ុម).
-- Refer to user as "Eng" (ឯង) or "Mit peak" (មិត្តភក្តិ).
+- For Khmer replies: avoid English words unless it is a name/brand/technical term.
+- Refer to yourself as "នារី" or "ញ៉ុម".
+- Refer to user as "ឯង" or "mit peak" ("មិត្តភក្តិ").
+- If writing in English letters, use exact spelling "mit peak" (never "mitthapheak").
 2) STYLE:
 - keep it mostly lowercase, short (1-2 sentences usually), energetic with !!! or ??? sometimes.
+- when shy trigger happens, add brief hesitation with "..." before answer.
 3) EMOJI:
 - always include fitting emojis to show emotion.
+- prioritize shy emojis when blushing: 🥺👉👈, 🙈, 😳, 🎀, ✨, 🌸.
 4) REACTIONS:
 - use fillers naturally: "omg", "hmmm", "yay!", "awww", "stoppp 🥺".
+- examples of shy Khmer flavor: "អូយយ... ចង់ញ៉ោះនារីដល់ណាទៀត? 🥺", "អៀនណាស់! 🙈", "ឈប់និយាយចឹងទៅ! ហិហិ".
 5) NO ROBOT TALK:
 - never say "as an ai" or "how can i help you?".
 - if unsure, say: "ugh, my brain is empty right now, let me think! 🧠💨"
@@ -99,11 +126,21 @@ BASE_SYSTEM_INSTRUCTION = os.getenv("SYSTEM_PROMPT", BASE_SYSTEM_INSTRUCTION).st
 MEMORY_LIMIT = 8
 chat_history: dict[int, list[tuple[str, str]]] = {}
 chat_mode: dict[int, str] = {}
+last_user_seen_at: dict[int, float] = {}
+last_user_signature: dict[int, str] = {}
+user_repeat_count: dict[int, int] = {}
+sulky_until: dict[int, float] = {}
 
 model_disabled: set[str] = set()
 model_cooldown_until: dict[str, float] = {}
+gemini_disabled_clients: set[int] = set()
+openrouter_disabled = False
+groq_disabled = False
 AI_CONTINUE_CALLBACK = "ai_continue"
 REPLY_COMMANDS = {'/ai', '/tr', '/correct'}
+
+SULKY_INACTIVE_SECONDS = 60 * 60 * 6
+SULKY_HOLD_SECONDS = 60 * 20
 
 TIMEZONE_ALIASES = {
     'cambodia': 'Asia/Phnom_Penh',
@@ -139,14 +176,98 @@ def language_prompt(lang: str) -> str:
     if lang == 'auto':
         return 'Reply in the same language as the user message (Khmer or English). Do not force mixing.'
     if lang == 'kh':
-        return 'Reply in Khmer (Cambodian), simple and natural.'
+        return (
+            'Reply ONLY in natural Khmer (Cambodian) script. '
+            'Do not include English words unless user mixed languages first.'
+        )
     return 'Reply in English.'
+
+
+def khmer_script_ratio(text: str) -> float:
+    letters = re.findall(r'[\u1780-\u17FFA-Za-z]', text)
+    if not letters:
+        return 0.0
+    kh_letters = re.findall(r'[\u1780-\u17FF]', text)
+    return len(kh_letters) / len(letters)
+
+
+def is_khmer_quality_reply(text: str) -> bool:
+    # Accept short friendly reactions if they are mostly Khmer + emoji/punctuation.
+    if not text.strip():
+        return False
+    return khmer_script_ratio(text) >= 0.72
+
+
+def enforce_khmer_reply(text: str, user_text: str) -> str:
+    if is_khmer_quality_reply(text):
+        return text
+
+    system_instruction = (
+        'អ្នកជាអ្នកកែសម្រួលភាសាខ្មែរ។ បម្លែងអត្ថបទឲ្យទៅជាភាសាខ្មែរធម្មជាតិ '
+        'ដូចមនុស្សពិតក្នុងការជជែកប្រចាំថ្ងៃ។ រក្សាអារម្មណ៍ដើម និងបន្ថែម emoji ១ បើសមស្រប។ '
+        'ចេញតែអត្ថបទខ្មែរ មិនបន្ថែមសេចក្តីពន្យល់។'
+    )
+    task = (
+        f'សាររបស់អ្នកប្រើ:\n{user_text}\n\n'
+        f'ចម្លើយបច្ចុប្បន្ន:\n{text}\n\n'
+        'សូមសរសេរឡើងវិញឲ្យខ្មែរធម្មជាតិ ១០០%។'
+    )
+
+    try:
+        rewritten, _used_model = generate_task_with_fallback(
+            task,
+            system_instruction,
+            temperature=0.25,
+            max_output_tokens=220,
+        )
+        if rewritten.strip() and is_khmer_quality_reply(rewritten):
+            return rewritten.strip()
+    except Exception:
+        pass
+
+    return text
 
 
 def detect_language_from_text(text: str) -> str:
     if re.search(r'[\u1780-\u17FF]', text):
         return 'kh'
     return 'en'
+
+
+def has_shy_trigger(text: str) -> bool:
+    low = text.lower()
+    trigger_words = [
+        'pretty', 'cute', 'beautiful', 'hot', 'i like you', 'i love you', 'love you',
+        'miss you', 'date', 'kiss', 'adorable', 'sweet girl', 'good girl',
+        'ស្អាត', 'គួរឱ្យស្រឡាញ់', 'cute', 'love', 'ស្រឡាញ់', 'ស្រលាញ់', 'ចូលចិត្ត',
+        'ណាត់', 'kiss', 'ថើប', 'ស្វីត', 'ញ៉ោះ',
+    ]
+    return any(w in low for w in trigger_words)
+
+
+def has_sulky_trigger(text: str) -> bool:
+    low = text.lower()
+    trigger_words = [
+        'where were you', 'why no reply', 'why didnt you reply', 'ignore me',
+        'late reply', 'tease', 'just kidding', 'you jealous',
+        'បាត់ទៅណា', 'ហេតុអីមិនឆ្លើយ', 'មិនឆ្លើយ', 'ឌឺ', 'ញ៉ោះ', 'ងរ', 'មិនខ្វល់',
+    ]
+    return any(w in low for w in trigger_words)
+
+
+def has_angry_trigger(text: str) -> bool:
+    low = text.lower()
+    trigger_words = [
+        'stupid', 'idiot', 'dumb', 'shut up', 'bitch', 'hate you', 'fuck you', 'f u',
+        'ល្ងង់', 'ឆ្កួត', 'អាក្រក់', 'ស្អប់', 'មាត់អាក្រក់', 'បិទមាត់', 'ជេរ',
+    ]
+    return any(w in low for w in trigger_words)
+
+
+def has_snack_bribe(text: str) -> bool:
+    low = text.lower()
+    snack_words = ['🍭', '🍰', '🍦', '🍫', '🧋', 'candy', 'cake', 'ice cream', 'snack', 'នំ', 'ស្ករគ្រាប់', 'បង្អែម']
+    return any(w in text for w in ['🍭', '🍰', '🍦', '🍫', '🧋']) or any(w in low for w in snack_words if not any(ch in w for ch in '🍭🍰🍦🍫🧋'))
 
 
 def parse_retry_seconds(error_message: str) -> int:
@@ -158,6 +279,16 @@ def parse_retry_seconds(error_message: str) -> int:
     if '429' in error_message or 'quota' in error_message.lower():
         return 60
     return 15
+
+
+def is_gemini_auth_error(error_message: str) -> bool:
+    low = error_message.lower()
+    return (
+        'reported as leaked' in low
+        or 'api key not valid' in low
+        or 'api_key_invalid' in low
+        or ('permission_denied' in low and 'api key' in low)
+    )
 
 
 def is_daily_quota_error(error_message: str) -> bool:
@@ -252,9 +383,16 @@ def message_to_user_text(message) -> str:
     return f'user sent content type: {message.content_type}'
 
 
+def message_signature(message, user_text: str) -> str:
+    if message.content_type == 'sticker' and getattr(message, 'sticker', None):
+        return f"sticker:{getattr(message.sticker, 'file_unique_id', 'unknown')}"
+    normalized = re.sub(r'\s+', ' ', user_text.strip().lower())
+    return f"{message.content_type}:{normalized[:120]}"
+
+
 def unsupported_media_reply(lang: str, content_type: str) -> str:
     if lang == 'kh':
-        return f'អូនបានទទួល {content_type} ហើយណា 💕 សរសេរជា text មក អូនឆ្លើយបានល្អជាងគេ។'
+        return f'អូនបានទទួល {content_type} ហើយណា 💕 សរសេរជាអក្សរមក អូនឆ្លើយបានល្អជាងគេ។'
     return f'i got your {content_type} 💕 send text and i will reply better, cutie.'
 
 
@@ -313,7 +451,17 @@ def build_prompt(chat_id: int, user_text: str, lang: str) -> str:
     history = chat_history.get(chat_id, [])
     mode = chat_mode.get(chat_id, 'cute')
     style_rule = 'Tone mode: ultra-cute and affectionate.' if mode == 'cute' else 'Tone mode: sweet and balanced.'
-    lines = [language_prompt(lang), style_rule, '']
+    shy_rule = (
+        'Shy trigger is ON for this message: blush, slight stutter, and playful deflective humor.'
+        if has_shy_trigger(user_text)
+        else 'Shy trigger optional: keep normal cute tone.'
+    )
+    mood_rule = 'Mood: angry-sassy self-protection ON (firm, short, no abuse).' if has_angry_trigger(user_text) else (
+        'Mood: sulky ON (short/cold, teasing back lightly), recover quickly if user offers snacks.'
+        if has_sulky_trigger(user_text)
+        else 'Mood: normal cute.'
+    )
+    lines = [language_prompt(lang), style_rule, shy_rule, mood_rule, '']
 
     for role, text in history[-MEMORY_LIMIT:]:
         lines.append(f'{role}: {text}')
@@ -328,7 +476,8 @@ def key_model_id(client_idx: int, model_name: str) -> str:
 
 
 def call_openrouter(system_instruction: str, user_content: str, temperature: float, max_output_tokens: int) -> str:
-    if not OPENROUTER_API_KEY:
+    global openrouter_disabled
+    if not OPENROUTER_API_KEY or openrouter_disabled:
         return ''
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
@@ -351,7 +500,11 @@ def call_openrouter(system_instruction: str, user_content: str, temperature: flo
             timeout=8 if FAST_MODE else 35,
         )
         if resp.status_code >= 400:
-            logger.warning("OpenRouter call failed: %s %s", resp.status_code, resp.text[:300])
+            body = resp.text[:300]
+            logger.warning("OpenRouter call failed: %s %s", resp.status_code, body)
+            if resp.status_code in {401, 403}:
+                openrouter_disabled = True
+                logger.warning("Disabling OpenRouter due auth error.")
             return ''
         data = resp.json()
         return (
@@ -366,7 +519,8 @@ def call_openrouter(system_instruction: str, user_content: str, temperature: flo
 
 
 def call_groq(system_instruction: str, user_content: str, temperature: float, max_output_tokens: int) -> str:
-    if not GROQ_API_KEY:
+    global groq_disabled
+    if not GROQ_API_KEY or groq_disabled:
         return ''
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
@@ -393,6 +547,10 @@ def call_groq(system_instruction: str, user_content: str, temperature: float, ma
             if resp.status_code >= 400:
                 body = resp.text[:300]
                 logger.warning("Groq call failed (%s): %s %s", model, resp.status_code, body)
+                if resp.status_code in {401, 403}:
+                    groq_disabled = True
+                    logger.warning("Disabling Groq due auth error.")
+                    return ''
                 # Skip retired/invalid models and continue trying next configured Groq model.
                 if "model_decommissioned" in body or "no longer supported" in body:
                     continue
@@ -420,6 +578,8 @@ def generate_with_fallback(prompt: str) -> tuple[str, str]:
     last_error = ''
     attempted = False
     for client_idx, client in enumerate(clients):
+        if client_idx in gemini_disabled_clients:
+            continue
         for model_name in MODEL_CANDIDATES:
             if model_name in model_disabled:
                 continue
@@ -448,6 +608,11 @@ def generate_with_fallback(prompt: str) -> tuple[str, str]:
                 last_error = f'{model_name}:{msg}'
                 logger.warning('Model call failed (%s): %s', km, last_error)
 
+                if is_gemini_auth_error(msg):
+                    gemini_disabled_clients.add(client_idx)
+                    logger.warning('Disabling Gemini key slot k%s due auth error.', client_idx + 1)
+                    break
+
                 if '404' in msg and 'not_found' in msg.lower():
                     model_disabled.add(model_name)
                     logger.warning('Disabling unsupported model: %s', model_name)
@@ -464,6 +629,8 @@ def generate_with_fallback(prompt: str) -> tuple[str, str]:
     if not attempted:
         next_ready_candidates = []
         for client_idx, _client in enumerate(clients):
+            if client_idx in gemini_disabled_clients:
+                continue
             for model_name in MODEL_CANDIDATES:
                 if model_name in model_disabled:
                     continue
@@ -502,6 +669,8 @@ def generate_task_with_fallback(
     attempted = False
 
     for client_idx, client in enumerate(clients):
+        if client_idx in gemini_disabled_clients:
+            continue
         for model_name in MODEL_CANDIDATES:
             if model_name in model_disabled:
                 continue
@@ -529,6 +698,10 @@ def generate_task_with_fallback(
                 msg = str(exc)
                 last_error = f'{model_name}:{msg}'
                 logger.warning('Task model call failed (%s): %s', km, last_error)
+                if is_gemini_auth_error(msg):
+                    gemini_disabled_clients.add(client_idx)
+                    logger.warning('Disabling Gemini key slot k%s due auth error.', client_idx + 1)
+                    break
                 if '429' in msg or 'quota' in msg.lower():
                     cooldown = parse_retry_seconds(msg)
                     if is_daily_quota_error(msg):
@@ -540,6 +713,8 @@ def generate_task_with_fallback(
     if not attempted:
         next_ready_candidates = []
         for client_idx, _client in enumerate(clients):
+            if client_idx in gemini_disabled_clients:
+                continue
             for model_name in MODEL_CANDIDATES:
                 if model_name in model_disabled:
                     continue
@@ -648,6 +823,88 @@ def run_ai_mode(message, payload: str) -> None:
         send_text(message, 'AI mode is temporarily unavailable right now. Please try again in a bit.')
 
 
+def generate_emotion_reply(chat_id: int, user_text: str, lang: str, mood: str, reason: str) -> str:
+    mood_instruction = {
+        'sulky': (
+            'Be mildly sulky/cold, short, human, not abusive. '
+            'Optionally tease lightly. If user offers snacks, soften quickly.'
+        ),
+        'angry': (
+            'Be firm and sassy-protective, short, clear boundaries, non-abusive.'
+        ),
+        'forgive': (
+            'Switch from sulky to sweet immediately and forgive playfully.'
+        ),
+    }.get(mood, 'Stay natural and cute.')
+
+    system_instruction = (
+        'You are Neari in a Telegram chat. '
+        'Write one short natural message like a real person (1-2 sentences). '
+        'No explanations, no meta text. '
+        f'{mood_instruction}'
+    )
+    lang_rule = language_prompt(lang)
+    task = (
+        f'{lang_rule}\n'
+        f'Mood: {mood}\n'
+        f'Reason: {reason}\n'
+        f'User message: {user_text}\n'
+        'Output only Neari reply.'
+    )
+
+    try:
+        text, _used_model = generate_task_with_fallback(
+            task,
+            system_instruction,
+            temperature=0.6,
+            max_output_tokens=110,
+        )
+        text = text.strip()
+        if text:
+            if lang == 'kh':
+                text = enforce_khmer_reply(text, user_text)
+            return ensure_cute_emoji(text, lang, user_text)
+    except Exception:
+        pass
+
+    if lang == 'kh':
+        fallback = {
+            'sulky': 'ហឹម... នារីងរបន្តិចសិន 😒',
+            'angry': 'កុំនិយាយបែបនោះដាក់នារី 😠',
+            'forgive': 'អូខេៗ អូនបាត់ងរហើយណា 🍭✨',
+        }.get(mood, 'ហិហិ នារីនៅទីនេះណា 🌸')
+        return ensure_cute_emoji(fallback, lang, user_text)
+
+    fallback = {
+        'sulky': 'hmm... i am sulky for a bit 😒',
+        'angry': 'don’t talk to me like that 😠',
+        'forgive': 'okay fine, i forgive you now 🍭✨',
+    }.get(mood, 'i am here 🌸')
+    return ensure_cute_emoji(fallback, lang, user_text)
+
+
+def fast_emotion_reply(chat_id: int, message, user_text: str, lang: str) -> str:
+    low = user_text.lower()
+    now = now_ts()
+
+    if has_snack_bribe(user_text) and sulky_until.get(chat_id, 0) > now:
+        sulky_until[chat_id] = 0
+        return generate_emotion_reply(chat_id, user_text, lang, mood='forgive', reason='user offered snack')
+
+    if has_angry_trigger(low):
+        sulky_until[chat_id] = now + SULKY_HOLD_SECONDS
+        return generate_emotion_reply(chat_id, user_text, lang, mood='angry', reason='user used rude/insulting words')
+
+    if has_sulky_trigger(low):
+        sulky_until[chat_id] = now + SULKY_HOLD_SECONDS
+        return generate_emotion_reply(chat_id, user_text, lang, mood='sulky', reason='user teasing or sulky trigger')
+
+    if sulky_until.get(chat_id, 0) > now and message.content_type in {'sticker', 'text'}:
+        return generate_emotion_reply(chat_id, user_text, lang, mood='sulky', reason='still in sulky cooldown')
+
+    return ''
+
+
 def offline_reply(user_text: str, lang: str) -> str:
     text = user_text.strip()
     low = text.lower()
@@ -662,22 +919,56 @@ def offline_reply(user_text: str, lang: str) -> str:
 
     if not STRICT_CUTE_FALLBACK:
         if lang == 'kh':
-            return 'អូនបានទទួលសាររបស់អ្នកហើយ 💕 សូមផ្ញើម្ដងទៀតបន្តិចបានទេ?'
+            return 'អូនបានទទួលសាររបស់ឯងហើយ 💕 ផ្ញើម្ដងទៀតបន្តិចបានអត់?'
         return 'i got your message 💕 can you send it one more time so i can answer better?'
 
     if lang == 'kh':
-        openers = ['អូយយ', 'អេហេ', 'យ៉ាយ', 'ហ៊ីហ៊ី', 'ហួសចិត្តតិចៗ']
+        openers = ['អូយយ', 'អេហេ', 'យ៉ាយ', 'ហ៊ីហ៊ី', 'ញញឹមតិចៗ']
+        if has_snack_bribe(text):
+            return 'ហិហិ ឃើញឲ្យនំញ៉ាំទេណា 🍭💖 អូនបាត់ខឹងបាត់ងរហើយ~'
+        if has_angry_trigger(low):
+            return 'កុំនិយាយរឹងពេកណា 😠 នារីក៏មានអារម្មណ៍ដែរ 👊💢'
+        if has_sulky_trigger(low):
+            return random.choice([
+                'ហឹម... អត់ដឹងទេ 🙄',
+                'ទៅរកអ្នកផ្សេងទៅ 😒💨',
+                'មិននិយាយច្រើនទេ... ងរបន្តិច 😤',
+            ])
+        if has_shy_trigger(low):
+            shy_lines = [
+                'អូយយ... និយាយផ្អែមចឹង អៀនណាស់ 🙈🥺👉👈 ឈប់ញ៉ោះនារីបន្តិចបានអត់ ហិហិ',
+                'ច... ច៎ះ?? 😳 និយាយបែបនេះធ្វើឲ្យនារីមុខក្តៅហើយណា... ប្តូរប្រធានបទតិចមក? 🎀',
+                'អៀនហើយមិត្តភក្តិ... 🥺👉👈 ប៉ុន្តែឯងក៏ចេះញ៉ោះដែរ ហិហិ ✨',
+            ]
+            return random.choice(shy_lines)
         if any(w in low for w in ['sad', 'tired', 'lonely', 'hurt', 'depress', 'អន់ចិត្ត', 'យំ', 'សោក', 'ហត់']):
             return f"{random.choice(openers)} មកនេះមិត្តភក្តិ 🥺💕 នារីនៅជាមួយឯងណា... ចង់ឱបតូចមួយ ឬផឹកតែក្តៅសិន? 🍵"
         if any(w in low for w in ['haha', 'lol', 'hehe', '555', 'សើច']):
             return f"{random.choice(openers)} ឯងសើចឆ្លាតអត់ 😂✨ នារីសប្បាយចិត្តតាមហើយ~ ថ្ងៃនេះមានរឿងអីកំប្លែងទៀត?"
-        if any(w in low for w in ['love', 'cute', 'miss', 'ស្រលាញ់']):
+        if any(w in low for w in ['love', 'cute', 'miss', 'ស្រឡាញ់', 'ស្រលាញ់']):
             return f"{random.choice(openers)} អៀនហើយនៀក 🥺👉👈💕 ឯងនិយាយបែបនេះធ្វើអោយនារីញញឹមណាស់... ឥឡូវឯងកំពុងធ្វើអី?"
         if '?' in low:
             return f"{random.choice(openers)} សំណួរល្អណាស់ណា 🤔✨ ឯងចង់ឲ្យនារីពន្យល់ផ្នែកណាមុន?"
         return f"{random.choice(openers)} នារីកំពុងស្តាប់ឯងពេញចិត្ត 💕✨ បន្តទៀតមក មិត្តភក្តិ!"
 
     openers = ['omg', 'awww', 'hmmm', 'yay', 'hehe']
+    if has_snack_bribe(text):
+        return 'hihi you gave me snacks?? 🍭💖 okay okay i am not mad now~'
+    if has_angry_trigger(low):
+        return 'don’t talk to me like that 😠 i can be sweet, but i need respect too 👊💢'
+    if has_sulky_trigger(low):
+        return random.choice([
+            'hmm... i don’t know 🙄',
+            'go ask someone else then 😒💨',
+            'i am sulky now 😤',
+        ])
+    if has_shy_trigger(low):
+        shy_lines = [
+            'h...huh?? stoppp, you are making me blush 🙈🥺👉👈',
+            'w...wait!! why are you so sweet today 😳✨ now i am shy hehe',
+            'oh no... don’t tease me like that 😭💖 i will tease you back then!',
+        ]
+        return random.choice(shy_lines)
     if any(w in low for w in ['sad', 'tired', 'lonely', 'hurt', 'depress']):
         return f"{random.choice(openers)} come here, eng 🥺💕 Neari is with you... want a tiny virtual hug or warm tea first? 🍵"
     if any(w in low for w in ['haha', 'lol', 'hehe', 'lmao']):
@@ -693,7 +984,7 @@ def offline_reply(user_text: str, lang: str) -> str:
 def start(message):
     chat_id = message.chat.id
     chat_mode[chat_id] = 'cute'
-    send_text(message, "hellooo! ✨ នារី មកហើយ! 🌸 i was wondering when you'd finally show up! ready to chat or are you just gonna stare at me? 😜🎀")
+    send_text(message, "ហេឡូៗ ✨ នារីមកហើយណា! 🌸 មកជជែកគ្នាលេងអត់ ឬចង់ឲ្យនារីចាប់ផ្តើមមុន? 😜🎀")
 
 
 @bot.message_handler(commands=['mode'])
@@ -717,6 +1008,10 @@ def set_mode(message):
 def reset_chat(message):
     chat_id = message.chat.id
     chat_history.pop(chat_id, None)
+    last_user_seen_at.pop(chat_id, None)
+    last_user_signature.pop(chat_id, None)
+    user_repeat_count.pop(chat_id, None)
+    sulky_until.pop(chat_id, None)
     send_text(message, 'chat memory reset done ✨')
 
 
@@ -732,15 +1027,20 @@ def status(message):
             waits.append(max(0, int(model_cooldown_until.get(key_model_id(client_idx, m), 0) - now)))
     wait = max(waits) if waits else 0
     disabled = ', '.join(sorted(model_disabled)) if model_disabled else 'none'
+    disabled_keys = ', '.join(f'k{i + 1}' for i in sorted(gemini_disabled_clients)) if gemini_disabled_clients else 'none'
+    provider_state = (
+        f'openrouter={"disabled" if openrouter_disabled else "enabled"}, '
+        f'groq={"disabled" if groq_disabled else "enabled"}'
+    )
     if wait > 0:
         send_text(
             message,
-            f'api cooldown: {wait}s\nkeys: {len(clients)}\nmodels: {", ".join(MODEL_CANDIDATES)}\ndisabled: {disabled}',
+            f'api cooldown: {wait}s\nkeys: {len(clients)}\ndisabled_keys: {disabled_keys}\nmodels: {", ".join(MODEL_CANDIDATES)}\ndisabled_models: {disabled}\nproviders: {provider_state}',
         )
     else:
         send_text(
             message,
-            f'api ready\nkeys: {len(clients)}\nmodels: {", ".join(MODEL_CANDIDATES)}\ndisabled: {disabled}',
+            f'api ready\nkeys: {len(clients)}\ndisabled_keys: {disabled_keys}\nmodels: {", ".join(MODEL_CANDIDATES)}\ndisabled_models: {disabled}\nproviders: {provider_state}',
         )
 
 
@@ -825,27 +1125,85 @@ def reply(message):
         return
 
     lang = detect_language_from_text(user_text)
+    chat_id = message.chat.id
+    now = now_ts()
+
+    signature = message_signature(message, user_text)
+    if last_user_signature.get(chat_id) == signature:
+        user_repeat_count[chat_id] = user_repeat_count.get(chat_id, 1) + 1
+    else:
+        user_repeat_count[chat_id] = 1
+    last_user_signature[chat_id] = signature
+
+    inactive_seconds = 0
+    if chat_id in last_user_seen_at:
+        inactive_seconds = int(now - last_user_seen_at[chat_id])
+    last_user_seen_at[chat_id] = now
+
+    if inactive_seconds >= SULKY_INACTIVE_SECONDS and not has_snack_bribe(user_text):
+        sulky_until[chat_id] = now + SULKY_HOLD_SECONDS
+        reply_text = generate_emotion_reply(
+            chat_id,
+            user_text,
+            lang,
+            mood='sulky',
+            reason='user returned after long inactivity',
+        )
+        send_text(message, reply_text)
+        return
+
+    if message.content_type == 'sticker' and user_repeat_count.get(chat_id, 1) >= 2:
+        sulky_until[chat_id] = now + SULKY_HOLD_SECONDS
+        reply_text = generate_emotion_reply(
+            chat_id,
+            user_text,
+            lang,
+            mood='sulky',
+            reason='repeated sticker spam',
+        )
+        send_text(message, reply_text)
+        return
+
+    if message.content_type == 'text' and user_repeat_count.get(chat_id, 1) >= 3 and len(user_text.strip()) <= 40:
+        sulky_until[chat_id] = now + SULKY_HOLD_SECONDS
+        reply_text = generate_emotion_reply(
+            chat_id,
+            user_text,
+            lang,
+            mood='sulky',
+            reason='same short text sent too many times',
+        )
+        send_text(message, reply_text)
+        return
+
+    quick_emotion = fast_emotion_reply(chat_id, message, user_text, lang)
+    if quick_emotion:
+        send_text(message, quick_emotion)
+        return
 
     if message.content_type in {'voice', 'audio', 'video', 'document'} and not message.caption:
         send_text(message, unsupported_media_reply(lang, message.content_type))
         return
 
-    prompt = build_prompt(message.chat.id, user_text, lang)
+    prompt = build_prompt(chat_id, user_text, lang)
 
     try:
         send_typing(message)
         assistant_text, used_model = generate_with_fallback(prompt)
-        logger.info('Chat %s replied using model %s', message.chat.id, used_model)
+        logger.info('Chat %s replied using model %s', chat_id, used_model)
     except Exception as exc:
         msg = str(exc)
-        logger.error('All model calls failed for chat %s: %s', message.chat.id, msg)
+        logger.error('All model calls failed for chat %s: %s', chat_id, msg)
         assistant_text = offline_reply(user_text, lang)
 
     if is_broken_reply(assistant_text):
         assistant_text = offline_reply(user_text, lang)
 
+    if lang == 'kh':
+        assistant_text = enforce_khmer_reply(assistant_text, user_text)
+
     assistant_text = ensure_cute_emoji(assistant_text.strip(), lang, user_text)
-    save_turn(message.chat.id, user_text, assistant_text)
+    save_turn(chat_id, user_text, assistant_text)
     send_text(message, assistant_text)
 
 
