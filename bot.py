@@ -47,6 +47,8 @@ STRICT_CUTE_FALLBACK = os.getenv('STRICT_CUTE_FALLBACK', 'false').strip().lower(
 FAST_MODE = os.getenv('FAST_MODE', 'true').strip().lower() in {'1', 'true', 'yes', 'on'}
 CHAT_MAX_OUTPUT_TOKENS = int(os.getenv('CHAT_MAX_OUTPUT_TOKENS', '120'))
 TASK_MAX_OUTPUT_TOKENS = int(os.getenv('TASK_MAX_OUTPUT_TOKENS', '300'))
+BOT_TIMEZONE = os.getenv('BOT_TIMEZONE', 'Asia/Phnom_Penh').strip() or 'Asia/Phnom_Penh'
+NEARI_KNOWLEDGE_MODE = os.getenv('NEARI_KNOWLEDGE_MODE', 'true').strip().lower() in {'1', 'true', 'yes', 'on'}
 
 if not BOT_TOKEN:
     raise RuntimeError(f"Missing BOT_TOKEN environment variable. Expected in: {ENV_PATH}")
@@ -130,6 +132,8 @@ last_user_seen_at: dict[int, float] = {}
 last_user_signature: dict[int, str] = {}
 user_repeat_count: dict[int, int] = {}
 sulky_until: dict[int, float] = {}
+bot_self_id: int | None = None
+bot_self_username: str = ''
 
 model_disabled: set[str] = set()
 model_cooldown_until: dict[str, float] = {}
@@ -170,6 +174,48 @@ TIMEZONE_ALIASES = {
 
 def now_ts() -> float:
     return time.time()
+
+
+def current_time_context() -> str:
+    try:
+        now_local = datetime.now(ZoneInfo(BOT_TIMEZONE))
+        return (
+            f"Current date/time now: {now_local.strftime('%Y-%m-%d %H:%M:%S')} "
+            f"({BOT_TIMEZONE}). Use this as current time."
+        )
+    except Exception:
+        now_utc = datetime.now(ZoneInfo('UTC'))
+        return (
+            f"Current date/time now: {now_utc.strftime('%Y-%m-%d %H:%M:%S')} "
+            "(UTC). Use this as current time."
+        )
+
+
+def inject_runtime_context(text: str) -> str:
+    return (
+        f"{current_time_context()}\n"
+        "Output clean plain text only; do not wrap whole reply in quotes.\n\n"
+        f"{text}"
+    )
+
+
+def clean_ai_output(text: str) -> str:
+    t = (text or '').strip()
+    if not t:
+        return t
+
+    quote_pairs = [('"', '"'), ("'", "'"), ('“', '”'), ('‘', '’')]
+    for left, right in quote_pairs:
+        if len(t) >= 2 and t.startswith(left) and t.endswith(right):
+            t = t[1:-1].strip()
+            break
+
+    if t and t[0] in {'"', "'", '“', '‘'} and (len(t) == 1 or t[-1] not in {'"', "'", '”', '’'}):
+        t = t[1:].strip()
+    if t and t[-1] in {'"', "'", '”', '’'} and (len(t) == 1 or t[0] not in {'"', "'", '“', '‘'}):
+        t = t[:-1].strip()
+
+    return t
 
 
 def language_prompt(lang: str) -> str:
@@ -390,6 +436,50 @@ def message_signature(message, user_text: str) -> str:
     return f"{message.content_type}:{normalized[:120]}"
 
 
+def get_bot_identity() -> tuple[int | None, str]:
+    global bot_self_id, bot_self_username
+    if bot_self_id is not None or bot_self_username:
+        return bot_self_id, bot_self_username
+    try:
+        me = bot.get_me()
+        bot_self_id = getattr(me, 'id', None)
+        bot_self_username = (getattr(me, 'username', '') or '').strip().lower()
+    except Exception:
+        pass
+    return bot_self_id, bot_self_username
+
+
+def has_neari_call(user_text: str) -> bool:
+    low = user_text.lower()
+    return 'neari' in low or 'នារី' in user_text
+
+
+def is_reply_to_this_bot(message) -> bool:
+    if not message.reply_to_message or not getattr(message.reply_to_message, 'from_user', None):
+        return False
+    uid = getattr(message.reply_to_message.from_user, 'id', None)
+    uname = (getattr(message.reply_to_message.from_user, 'username', '') or '').strip().lower()
+    my_id, my_uname = get_bot_identity()
+    if my_id is not None and uid == my_id:
+        return True
+    if my_uname and uname and uname == my_uname:
+        return True
+    return False
+
+
+def should_respond_in_group(message, user_text: str) -> bool:
+    if message.chat.type not in {'group', 'supergroup'}:
+        return True
+    if is_reply_to_this_bot(message):
+        return True
+    if has_neari_call(user_text):
+        return True
+    _my_id, my_uname = get_bot_identity()
+    if my_uname and f'@{my_uname}' in user_text.lower():
+        return True
+    return False
+
+
 def unsupported_media_reply(lang: str, content_type: str) -> str:
     if lang == 'kh':
         return f'អូនបានទទួល {content_type} ហើយណា 💕 សរសេរជាអក្សរមក អូនឆ្លើយបានល្អជាងគេ។'
@@ -442,8 +532,6 @@ def is_broken_reply(text: str) -> bool:
     # Catches malformed endings like: "you’", "you'"
     if re.search(r"\byou['’]\s*(?:[^\w]|$)", t.lower()):
         return True
-    if t.endswith(("'", "’", '"', "“", "”")):
-        return True
     return False
 
 
@@ -461,7 +549,7 @@ def build_prompt(chat_id: int, user_text: str, lang: str) -> str:
         if has_sulky_trigger(user_text)
         else 'Mood: normal cute.'
     )
-    lines = [language_prompt(lang), style_rule, shy_rule, mood_rule, '']
+    lines = [language_prompt(lang), current_time_context(), style_rule, shy_rule, mood_rule, '']
 
     for role, text in history[-MEMORY_LIMIT:]:
         lines.append(f'{role}: {text}')
@@ -574,6 +662,8 @@ def call_groq(system_instruction: str, user_content: str, temperature: float, ma
 
 def generate_with_fallback(prompt: str) -> tuple[str, str]:
     now = now_ts()
+    prompt_with_context = inject_runtime_context(prompt)
+    system_instruction = inject_runtime_context(BASE_SYSTEM_INSTRUCTION)
 
     last_error = ''
     attempted = False
@@ -591,15 +681,15 @@ def generate_with_fallback(prompt: str) -> tuple[str, str]:
             try:
                 response = client.models.generate_content(
                     model=model_name,
-                    contents=prompt,
+                    contents=prompt_with_context,
                     config={
-                        "system_instruction": BASE_SYSTEM_INSTRUCTION,
+                        "system_instruction": system_instruction,
                         "temperature": 0.9,
                         "top_p": 0.95,
                         "max_output_tokens": CHAT_MAX_OUTPUT_TOKENS,
                     },
                 )
-                text = (getattr(response, 'text', '') or '').strip()
+                text = clean_ai_output((getattr(response, 'text', '') or '').strip())
                 if text:
                     return text, f'{model_name}#k{client_idx + 1}'
                 last_error = f'{model_name}:empty_response'
@@ -638,21 +728,25 @@ def generate_with_fallback(prompt: str) -> tuple[str, str]:
         next_ready = min(next_ready_candidates, default=now + 15)
         wait = max(1, int(next_ready - now))
         # Try OpenRouter before returning cooldown if available.
-        text = call_openrouter(BASE_SYSTEM_INSTRUCTION, prompt, temperature=0.9, max_output_tokens=CHAT_MAX_OUTPUT_TOKENS)
+        text = call_openrouter(system_instruction, prompt_with_context, temperature=0.9, max_output_tokens=CHAT_MAX_OUTPUT_TOKENS)
+        text = clean_ai_output(text)
         if text:
             return text, f'openrouter:{OPENROUTER_MODEL}'
         # Try Groq before returning cooldown if available.
-        text = call_groq(BASE_SYSTEM_INSTRUCTION, prompt, temperature=0.9, max_output_tokens=CHAT_MAX_OUTPUT_TOKENS)
+        text = call_groq(system_instruction, prompt_with_context, temperature=0.9, max_output_tokens=CHAT_MAX_OUTPUT_TOKENS)
+        text = clean_ai_output(text)
         if text:
             return text, f'groq:{GROQ_MODEL}'
         raise RuntimeError(f'models_cooldown:{wait}')
 
     # Gemini attempts failed; try OpenRouter fallback if configured.
-    text = call_openrouter(BASE_SYSTEM_INSTRUCTION, prompt, temperature=0.9, max_output_tokens=CHAT_MAX_OUTPUT_TOKENS)
+    text = call_openrouter(system_instruction, prompt_with_context, temperature=0.9, max_output_tokens=CHAT_MAX_OUTPUT_TOKENS)
+    text = clean_ai_output(text)
     if text:
         return text, f'openrouter:{OPENROUTER_MODEL}'
     # Try Groq fallback if configured.
-    text = call_groq(BASE_SYSTEM_INSTRUCTION, prompt, temperature=0.9, max_output_tokens=CHAT_MAX_OUTPUT_TOKENS)
+    text = call_groq(system_instruction, prompt_with_context, temperature=0.9, max_output_tokens=CHAT_MAX_OUTPUT_TOKENS)
+    text = clean_ai_output(text)
     if text:
         return text, f'groq:{GROQ_MODEL}'
     raise RuntimeError(last_error or 'all_models_failed')
@@ -665,6 +759,8 @@ def generate_task_with_fallback(
     max_output_tokens: int = 260,
 ) -> tuple[str, str]:
     now = now_ts()
+    task_with_context = inject_runtime_context(task_text)
+    system_with_context = inject_runtime_context(system_instruction)
     last_error = ''
     attempted = False
 
@@ -682,15 +778,15 @@ def generate_task_with_fallback(
             try:
                 response = client.models.generate_content(
                     model=model_name,
-                    contents=task_text,
+                    contents=task_with_context,
                     config={
-                        "system_instruction": system_instruction,
+                        "system_instruction": system_with_context,
                         "temperature": temperature,
                         "top_p": 0.9,
                         "max_output_tokens": min(max_output_tokens, TASK_MAX_OUTPUT_TOKENS),
                     },
                 )
-                text = (getattr(response, 'text', '') or '').strip()
+                text = clean_ai_output((getattr(response, 'text', '') or '').strip())
                 if text:
                     return text, f'{model_name}#k{client_idx + 1}'
                 last_error = f'{model_name}:empty_response'
@@ -721,18 +817,22 @@ def generate_task_with_fallback(
                 next_ready_candidates.append(model_cooldown_until.get(key_model_id(client_idx, model_name), now + 15))
         next_ready = min(next_ready_candidates, default=now + 15)
         wait = max(1, int(next_ready - now))
-        text = call_openrouter(system_instruction, task_text, temperature=temperature, max_output_tokens=min(max_output_tokens, TASK_MAX_OUTPUT_TOKENS))
+        text = call_openrouter(system_with_context, task_with_context, temperature=temperature, max_output_tokens=min(max_output_tokens, TASK_MAX_OUTPUT_TOKENS))
+        text = clean_ai_output(text)
         if text:
             return text, f'openrouter:{OPENROUTER_MODEL}'
-        text = call_groq(system_instruction, task_text, temperature=temperature, max_output_tokens=min(max_output_tokens, TASK_MAX_OUTPUT_TOKENS))
+        text = call_groq(system_with_context, task_with_context, temperature=temperature, max_output_tokens=min(max_output_tokens, TASK_MAX_OUTPUT_TOKENS))
+        text = clean_ai_output(text)
         if text:
             return text, f'groq:{GROQ_MODEL}'
         raise RuntimeError(f'models_cooldown:{wait}')
 
-    text = call_openrouter(system_instruction, task_text, temperature=temperature, max_output_tokens=min(max_output_tokens, TASK_MAX_OUTPUT_TOKENS))
+    text = call_openrouter(system_with_context, task_with_context, temperature=temperature, max_output_tokens=min(max_output_tokens, TASK_MAX_OUTPUT_TOKENS))
+    text = clean_ai_output(text)
     if text:
         return text, f'openrouter:{OPENROUTER_MODEL}'
-    text = call_groq(system_instruction, task_text, temperature=temperature, max_output_tokens=min(max_output_tokens, TASK_MAX_OUTPUT_TOKENS))
+    text = call_groq(system_with_context, task_with_context, temperature=temperature, max_output_tokens=min(max_output_tokens, TASK_MAX_OUTPUT_TOKENS))
+    text = clean_ai_output(text)
     if text:
         return text, f'groq:{GROQ_MODEL}'
     raise RuntimeError(last_error or 'all_models_failed')
@@ -823,6 +923,58 @@ def run_ai_mode(message, payload: str) -> None:
         send_text(message, 'AI mode is temporarily unavailable right now. Please try again in a bit.')
 
 
+def should_use_neari_knowledge(user_text: str, lang: str) -> bool:
+    text = user_text.strip()
+    if not text or len(text) < 8:
+        return False
+
+    low = text.lower()
+    en_starts = ('what', 'why', 'how', 'when', 'where', 'who', 'which', 'explain', 'tell me', 'can you')
+    en_keywords = (
+        'meaning', 'compare', 'difference', 'guide', 'steps', 'calculate', 'code', 'python',
+        'javascript', 'error', 'fix', 'translate', 'summary', 'history', 'science', 'math',
+    )
+    kh_keywords = (
+        'អ្វី', 'អី', 'ម៉េច', 'ធ្វើម៉េច', 'ហេតុអី', 'ពន្យល់', 'ប្រៀបធៀប', 'ន័យ', 'ប៉ុន្មាន',
+        'កូដ', 'កំហុស', 'ជួយ', 'គណនា', 'ប្រវត្តិ', 'វិទ្យាសាស្ត្រ',
+    )
+
+    if '?' in text:
+        return True
+    if low.startswith(en_starts):
+        return True
+    if any(k in low for k in en_keywords):
+        return True
+    if lang == 'kh' and any(k in text for k in kh_keywords):
+        return True
+    return False
+
+
+def generate_neari_knowledge_reply(user_text: str, lang: str) -> tuple[str, str]:
+    system_instruction = (
+        "You are Neari (នារី), a friendly and cute assistant with accurate knowledge. "
+        "Answer clearly and correctly. If uncertain, say briefly that you are not sure. "
+        "Keep a warm human tone (1-3 short sentences unless user asks for details). "
+        "Do not invent facts."
+    )
+    task = (
+        f"{language_prompt(lang)}\n"
+        "User asks an information question. Give a useful direct answer first, then a friendly Neari tone.\n"
+        f"Question: {user_text}"
+    )
+    answer, used_model = generate_task_with_fallback(
+        task,
+        system_instruction,
+        temperature=0.25,
+        max_output_tokens=320,
+    )
+    answer = clean_ai_output(answer.strip())
+    if lang == 'kh':
+        answer = enforce_khmer_reply(answer, user_text)
+    answer = ensure_cute_emoji(answer, lang, user_text)
+    return answer, used_model
+
+
 def generate_emotion_reply(chat_id: int, user_text: str, lang: str, mood: str, reason: str) -> str:
     mood_instruction = {
         'sulky': (
@@ -889,18 +1041,44 @@ def fast_emotion_reply(chat_id: int, message, user_text: str, lang: str) -> str:
 
     if has_snack_bribe(user_text) and sulky_until.get(chat_id, 0) > now:
         sulky_until[chat_id] = 0
-        return generate_emotion_reply(chat_id, user_text, lang, mood='forgive', reason='user offered snack')
+        if lang == 'kh':
+            return random.choice([
+                'ហិហិ មាននំឲ្យនារីមែន? 🍭 អូខេ អូនបាត់ងរហើយណា 🎀✨',
+                'អូយយ មានបង្អែមទៀត 🥺🍰 លើកនេះអភ័យទោសឲ្យ 💖',
+            ])
+        return random.choice([
+            'hihi snacks for me? 🍭 okay, i forgive you now 🎀✨',
+            'aww dessert bribe worked 🥺🍰 i am sweet again 💖',
+        ])
 
     if has_angry_trigger(low):
         sulky_until[chat_id] = now + SULKY_HOLD_SECONDS
-        return generate_emotion_reply(chat_id, user_text, lang, mood='angry', reason='user used rude/insulting words')
+        if lang == 'kh':
+            return random.choice([
+                'កុំនិយាយបែបនោះដាក់នារី 😠 នារីក៏មានអារម្មណ៍ដែរ 👊💢',
+                'ឈប់ឌឺពេកណា 😤 និយាយសុភាពបានអត់?',
+            ])
+        return random.choice([
+            "don't talk to me like that 😠 keep it respectful.",
+            'too rude 😤 say it nicely.',
+        ])
 
     if has_sulky_trigger(low):
         sulky_until[chat_id] = now + SULKY_HOLD_SECONDS
-        return generate_emotion_reply(chat_id, user_text, lang, mood='sulky', reason='user teasing or sulky trigger')
+        if lang == 'kh':
+            return random.choice([
+                'ហឹម... នារីងរបន្តិចសិន 😒💨',
+                'ទៅសួរអ្នកផ្សេងទៅ 🙄 អូនមិនដឹងទេ!',
+            ])
+        return random.choice([
+            'hmm... i am sulky now 😒💨',
+            "go ask someone else 🙄 i don't know.",
+        ])
 
     if sulky_until.get(chat_id, 0) > now and message.content_type in {'sticker', 'text'}:
-        return generate_emotion_reply(chat_id, user_text, lang, mood='sulky', reason='still in sulky cooldown')
+        if lang == 'kh':
+            return random.choice(['ហឹម... មិនទាន់បាត់ងរទេ 😒', 'ឲ្យអូនស្ងប់ចិត្តបន្តិចសិន 🙄💨'])
+        return random.choice(['hmm... still sulking 😒', 'give me a moment 🙄💨'])
 
     return ''
 
@@ -1116,12 +1294,10 @@ def ai_continue_callback(call):
     content_types=['text', 'photo', 'sticker', 'voice', 'video', 'audio', 'document', 'location', 'contact'],
 )
 def reply(message):
-    # In group chats, respond only when user sends a reply message.
-    if message.chat.type in {'group', 'supergroup'} and not message.reply_to_message:
-        return
-
     user_text = message_to_user_text(message)
     if message.content_type == 'text' and user_text.startswith('/'):
+        return
+    if not should_respond_in_group(message, user_text):
         return
 
     lang = detect_language_from_text(user_text)
@@ -1184,6 +1360,17 @@ def reply(message):
     if message.content_type in {'voice', 'audio', 'video', 'document'} and not message.caption:
         send_text(message, unsupported_media_reply(lang, message.content_type))
         return
+
+    if NEARI_KNOWLEDGE_MODE and message.content_type == 'text' and should_use_neari_knowledge(user_text, lang):
+        try:
+            send_typing(message)
+            answer, used_model = generate_neari_knowledge_reply(user_text, lang)
+            logger.info('Chat %s knowledge mode used model %s', chat_id, used_model)
+            save_turn(chat_id, user_text, answer)
+            send_text(message, answer)
+            return
+        except Exception as exc:
+            logger.warning('Knowledge mode failed for chat %s: %s', chat_id, exc)
 
     prompt = build_prompt(chat_id, user_text, lang)
 
