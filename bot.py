@@ -196,7 +196,8 @@ def current_time_context() -> str:
 def inject_runtime_context(text: str) -> str:
     return (
         f"{current_time_context()}\n"
-        "Output clean plain text only; do not wrap whole reply in quotes.\n\n"
+        "Output clean plain text only; do not wrap whole reply in quotes.\n"
+        "Do not use Markdown formatting such as ``` or **.\n\n"
         f"{text}"
     )
 
@@ -216,6 +217,15 @@ def clean_ai_output(text: str) -> str:
         t = t[1:].strip()
     if t and t[-1] in {'"', "'", '”', '’'} and (len(t) == 1 or t[0] not in {'"', "'", '“', '‘'}):
         t = t[:-1].strip()
+
+    # Remove fenced code blocks while keeping inner content.
+    t = re.sub(r"```[a-zA-Z0-9_-]*\n?", "", t)
+    t = t.replace("```", "")
+    # Remove markdown emphasis markers.
+    t = t.replace("**", "")
+    t = t.replace("__", "")
+    # Normalize accidental markdown headers/bullets spacing.
+    t = re.sub(r"^\s{0,3}#{1,6}\s*", "", t, flags=re.MULTILINE)
 
     return t
 
@@ -914,7 +924,10 @@ def ai_continue_markup():
 def run_ai_mode(message, payload: str) -> None:
     system_instruction = (
         "You are a helpful, accurate general AI assistant. "
-        "Answer clearly and directly. If uncertain, say so briefly."
+        "Answer clearly and directly. If uncertain, say so briefly. "
+        "For coding questions, prefer one best-practice solution first "
+        "(secure, robust, modern APIs), then short notes only if needed. "
+        "Avoid outdated or unnecessary libraries unless the user asks for alternatives."
     )
     chat_id = message.chat.id
     task_payload = build_ai_task(chat_id, payload)
@@ -983,7 +996,8 @@ def generate_neari_knowledge_reply(user_text: str, lang: str) -> tuple[str, str]
         "You are Neari (នារី), a friendly and cute assistant with accurate knowledge. "
         "Answer clearly and correctly. If uncertain, say briefly that you are not sure. "
         "Keep a warm human tone (1-3 short sentences unless user asks for details). "
-        "Do not invent facts."
+        "Do not invent facts. "
+        "For coding questions, give correct best-practice code with minimal fluff."
     )
     task = (
         f"{language_prompt(lang)}\n"
