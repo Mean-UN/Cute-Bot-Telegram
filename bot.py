@@ -126,7 +126,9 @@ BOUNDARIES:
 BASE_SYSTEM_INSTRUCTION = os.getenv("SYSTEM_PROMPT", BASE_SYSTEM_INSTRUCTION).strip()
 
 MEMORY_LIMIT = 8
+AI_MEMORY_LIMIT = 6
 chat_history: dict[int, list[tuple[str, str]]] = {}
+ai_history: dict[int, list[tuple[str, str]]] = {}
 chat_mode: dict[int, str] = {}
 last_user_seen_at: dict[int, float] = {}
 last_user_signature: dict[int, str] = {}
@@ -847,6 +849,28 @@ def save_turn(chat_id: int, user_text: str, assistant_text: str) -> None:
         chat_history[chat_id] = history[-MEMORY_LIMIT * 2 :]
 
 
+def save_ai_turn(chat_id: int, user_text: str, assistant_text: str) -> None:
+    history = ai_history.setdefault(chat_id, [])
+    history.append(('User', user_text))
+    history.append(('Assistant', assistant_text))
+    if len(history) > AI_MEMORY_LIMIT * 2:
+        ai_history[chat_id] = history[-AI_MEMORY_LIMIT * 2 :]
+
+
+def build_ai_task(chat_id: int, payload: str) -> str:
+    history = ai_history.get(chat_id, [])
+    lines = [
+        "Continue this same AI conversation and keep context from previous turns.",
+        "If user asks a new topic, answer it normally.",
+        "",
+    ]
+    for role, text in history[-AI_MEMORY_LIMIT * 2:]:
+        lines.append(f"{role}: {text}")
+    lines.append(f"User: {payload}")
+    lines.append("Assistant:")
+    return '\n'.join(lines)
+
+
 def get_command_payload(message) -> str:
     if message.text:
         parts = message.text.split(maxsplit=1)
@@ -892,19 +916,23 @@ def run_ai_mode(message, payload: str) -> None:
         "You are a helpful, accurate general AI assistant. "
         "Answer clearly and directly. If uncertain, say so briefly."
     )
+    chat_id = message.chat.id
+    task_payload = build_ai_task(chat_id, payload)
     try:
         send_typing(message)
         answer, used_model = generate_task_with_fallback(
-            payload,
+            task_payload,
             system_instruction,
             temperature=0.35,
             max_output_tokens=500,
         )
-        logger.info('Chat %s /ai used model %s', message.chat.id, used_model)
-        send_text(message, answer.strip(), reply_markup=ai_continue_markup())
+        answer = answer.strip()
+        save_ai_turn(chat_id, payload, answer)
+        logger.info('Chat %s /ai used model %s', chat_id, used_model)
+        send_text(message, answer, reply_markup=ai_continue_markup())
     except Exception as exc:
         msg = str(exc)
-        logger.error('/ai command failed for chat %s: %s', message.chat.id, msg)
+        logger.error('/ai command failed for chat %s: %s', chat_id, msg)
         if msg.startswith('models_cooldown:'):
             wait = msg.split(':', 1)[1]
             send_text(
@@ -1186,6 +1214,7 @@ def set_mode(message):
 def reset_chat(message):
     chat_id = message.chat.id
     chat_history.pop(chat_id, None)
+    ai_history.pop(chat_id, None)
     last_user_seen_at.pop(chat_id, None)
     last_user_signature.pop(chat_id, None)
     user_repeat_count.pop(chat_id, None)
@@ -1286,7 +1315,7 @@ def ai_command(message):
 def ai_continue_callback(call):
     chat_id = call.message.chat.id
     bot.answer_callback_query(call.id, "Use /ai <question> to continue")
-    bot.send_message(chat_id, "Continue AI mode: send `/ai your question`", parse_mode="Markdown")
+    bot.send_message(chat_id, "Continue AI mode: send `/ai your next question` (context is remembered).", parse_mode="Markdown")
 
 
 @bot.message_handler(
