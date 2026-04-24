@@ -45,10 +45,11 @@ GROQ_MODELS = [
 ]
 STRICT_CUTE_FALLBACK = os.getenv('STRICT_CUTE_FALLBACK', 'false').strip().lower() in {'1', 'true', 'yes', 'on'}
 FAST_MODE = os.getenv('FAST_MODE', 'true').strip().lower() in {'1', 'true', 'yes', 'on'}
-CHAT_MAX_OUTPUT_TOKENS = int(os.getenv('CHAT_MAX_OUTPUT_TOKENS', '120'))
-TASK_MAX_OUTPUT_TOKENS = int(os.getenv('TASK_MAX_OUTPUT_TOKENS', '300'))
+CHAT_MAX_OUTPUT_TOKENS = max(220, int(os.getenv('CHAT_MAX_OUTPUT_TOKENS', '120')))
+TASK_MAX_OUTPUT_TOKENS = max(900, int(os.getenv('TASK_MAX_OUTPUT_TOKENS', '300')))
 BOT_TIMEZONE = os.getenv('BOT_TIMEZONE', 'Asia/Phnom_Penh').strip() or 'Asia/Phnom_Penh'
 NEARI_KNOWLEDGE_MODE = os.getenv('NEARI_KNOWLEDGE_MODE', 'true').strip().lower() in {'1', 'true', 'yes', 'on'}
+TRANSLATE_MAX_OUTPUT_TOKENS = max(900, int(os.getenv('TRANSLATE_MAX_OUTPUT_TOKENS', '1200')))
 
 if not BOT_TOKEN:
     raise RuntimeError(f"Missing BOT_TOKEN environment variable. Expected in: {ENV_PATH}")
@@ -144,6 +145,31 @@ openrouter_disabled = False
 groq_disabled = False
 AI_CONTINUE_CALLBACK = "ai_continue"
 REPLY_COMMANDS = {'/ai', '/tr', '/correct'}
+START_HELP_TEXT = """
+Neari គឺជា Bot ឆ្លាតវៃ សម្រាប់ជួយសន្ទនា និងធ្វើការងារផ្សេងៗ នៅក្នុង Telegram Group ឬ Chat។
+
+មុខងារសំខាន់ៗដែល Bot អាចធ្វើបាន៖
+
+🔹 ប្រើពាក្យ “Neari” ឬ “នារី”
+- ដើម្បីចាប់ផ្តើមសន្ទនា ជាមួយ Bot នៅក្នុង Group
+- Bot នឹងឆ្លើយតបវិញ ដូចជាការជជែកជាមួយមនុស្សពិត
+
+🔹 Reply ឬ ឆ្លើយតប ទៅសាររបស់នារី
+- នៅពេលអ្នក Reply ទៅសារ Bot
+- Bot នឹងឆ្លើយតបមកវិញ ដើម្បីបន្តការសន្ទនា 🗨️
+
+🔹 ប្រើ /ai
+- ដើម្បីសួរ សំណួរគ្រប់យ៉ាង
+- ឧទាហរណ៍៖ ការសិក្សា ព័ត៌មាន ទំនាក់ទំនង ឬចំណេះដឹងទូទៅ 📚
+
+🔹 ប្រើ /correct
+- ដើម្បីកែពាក្យ ឬ វេយ្យាករណ៍
+- ជួយឲ្យសារ ឬអត្ថបទ របស់អ្នក ត្រឹមត្រូវ និងមានស្តង់ដារ ✍️
+
+🔹 ប្រើ /tr
+- ដើម្បីបកប្រែភាសា
+- អាចបកប្រែពី អង់គ្លេស ទៅ ភាសាខ្មែរ ឬភាសាផ្សេងៗ ទៅជាភាសាខ្មែរ 🌐
+""".strip()
 
 SULKY_INACTIVE_SECONDS = 60 * 60 * 6
 SULKY_HOLD_SECONDS = 60 * 20
@@ -239,6 +265,19 @@ def language_prompt(lang: str) -> str:
             'Do not include English words unless user mixed languages first.'
         )
     return 'Reply in English.'
+
+
+def wants_long_response(user_text: str) -> bool:
+    text = (user_text or '').strip()
+    if len(text) >= 140:
+        return True
+    low = text.lower()
+    en_hints = [
+        'long', 'longer', 'detail', 'detailed', 'explain more', 'full', 'step by step',
+        'in depth', 'complete', 'not short',
+    ]
+    kh_hints = ['វែង', 'លម្អិត', 'ពន្យល់ច្រើន', 'ពេញលេញ', 'កុំខ្លី', 'ជំហានៗ', 'សរសេរច្រើន']
+    return any(h in low for h in en_hints) or any(h in text for h in kh_hints)
 
 
 def khmer_script_ratio(text: str) -> float:
@@ -561,7 +600,12 @@ def build_prompt(chat_id: int, user_text: str, lang: str) -> str:
         if has_sulky_trigger(user_text)
         else 'Mood: normal cute.'
     )
-    lines = [language_prompt(lang), current_time_context(), style_rule, shy_rule, mood_rule, '']
+    length_rule = (
+        'Length: user asked for detail, give a longer helpful response (about 4-8 sentences) and do not over-shorten.'
+        if wants_long_response(user_text)
+        else 'Length: keep it short by default unless user asks for detail.'
+    )
+    lines = [language_prompt(lang), current_time_context(), style_rule, shy_rule, mood_rule, length_rule, '']
 
     for role, text in history[-MEMORY_LIMIT:]:
         lines.append(f'{role}: {text}')
@@ -931,13 +975,14 @@ def run_ai_mode(message, payload: str) -> None:
     )
     chat_id = message.chat.id
     task_payload = build_ai_task(chat_id, payload)
+    output_tokens = 900 if wants_long_response(payload) else 500
     try:
         send_typing(message)
         answer, used_model = generate_task_with_fallback(
             task_payload,
             system_instruction,
             temperature=0.35,
-            max_output_tokens=500,
+            max_output_tokens=output_tokens,
         )
         answer = answer.strip()
         save_ai_turn(chat_id, payload, answer)
@@ -1002,13 +1047,15 @@ def generate_neari_knowledge_reply(user_text: str, lang: str) -> tuple[str, str]
     task = (
         f"{language_prompt(lang)}\n"
         "User asks an information question. Give a useful direct answer first, then a friendly Neari tone.\n"
+        "If user asks for detail, provide a longer complete explanation.\n"
         f"Question: {user_text}"
     )
+    output_tokens = 900 if wants_long_response(user_text) else 320
     answer, used_model = generate_task_with_fallback(
         task,
         system_instruction,
         temperature=0.25,
-        max_output_tokens=320,
+        max_output_tokens=output_tokens,
     )
     answer = clean_ai_output(answer.strip())
     if lang == 'kh':
@@ -1204,7 +1251,7 @@ def offline_reply(user_text: str, lang: str) -> str:
 def start(message):
     chat_id = message.chat.id
     chat_mode[chat_id] = 'cute'
-    send_text(message, "ហេឡូៗ ✨ នារីមកហើយណា! 🌸 មកជជែកគ្នាលេងអត់ ឬចង់ឲ្យនារីចាប់ផ្តើមមុន? 😜🎀")
+    send_text(message, START_HELP_TEXT)
 
 
 @bot.message_handler(commands=['mode'])
@@ -1276,13 +1323,20 @@ def translate_command(message):
     target_lang = 'English' if src_lang == 'kh' else 'Khmer'
     system_instruction = (
         "You are a professional translator. Translate naturally for real-world daily usage. "
-        "Preserve meaning and tone. Output ONLY the translated text."
+        "Preserve all meaning, tone, and details. Do not summarize or shorten. "
+        "Keep paragraphs/line breaks where possible. Output ONLY the translated text."
     )
     task = f"Translate this text to {target_lang}:\n{payload}"
+    out_tokens = TRANSLATE_MAX_OUTPUT_TOKENS if len(payload) > 160 or wants_long_response(payload) else 420
 
     try:
         send_typing(message)
-        translated, used_model = generate_task_with_fallback(task, system_instruction, temperature=0.2, max_output_tokens=240)
+        translated, used_model = generate_task_with_fallback(
+            task,
+            system_instruction,
+            temperature=0.15,
+            max_output_tokens=out_tokens,
+        )
         logger.info('Chat %s translated using model %s', message.chat.id, used_model)
         send_text(message, translated.strip())
     except Exception as exc:
