@@ -50,6 +50,7 @@ TASK_MAX_OUTPUT_TOKENS = max(900, int(os.getenv('TASK_MAX_OUTPUT_TOKENS', '300')
 BOT_TIMEZONE = os.getenv('BOT_TIMEZONE', 'Asia/Phnom_Penh').strip() or 'Asia/Phnom_Penh'
 NEARI_KNOWLEDGE_MODE = os.getenv('NEARI_KNOWLEDGE_MODE', 'true').strip().lower() in {'1', 'true', 'yes', 'on'}
 TRANSLATE_MAX_OUTPUT_TOKENS = max(900, int(os.getenv('TRANSLATE_MAX_OUTPUT_TOKENS', '1200')))
+TRANSLATE_CHUNK_CHARS = max(700, int(os.getenv('TRANSLATE_CHUNK_CHARS', '1400')))
 
 if not BOT_TOKEN:
     raise RuntimeError(f"Missing BOT_TOKEN environment variable. Expected in: {ENV_PATH}")
@@ -301,7 +302,8 @@ def enforce_khmer_reply(text: str, user_text: str) -> str:
 
     system_instruction = (
         'អ្នកជាអ្នកកែសម្រួលភាសាខ្មែរ។ បម្លែងអត្ថបទឲ្យទៅជាភាសាខ្មែរធម្មជាតិ '
-        'ដូចមនុស្សពិតក្នុងការជជែកប្រចាំថ្ងៃ។ រក្សាអារម្មណ៍ដើម និងបន្ថែម emoji ១ បើសមស្រប។ '
+        'ដូចមនុស្សពិតក្នុងការជជែកប្រចាំថ្ងៃ។ រក្សាន័យ ព័ត៌មាន លេខ និងឈ្មោះដើមឲ្យដូចគ្នា ១០០% '
+        '(កុំបន្ថែម កុំលុប កុំកែការពិត)។ រក្សាអារម្មណ៍ដើម និងបន្ថែម emoji ១ បើសមស្រប។ '
         'ចេញតែអត្ថបទខ្មែរ មិនបន្ថែមសេចក្តីពន្យល់។'
     )
     task = (
@@ -453,6 +455,86 @@ def offline_translation_reply(user_text: str, lang: str) -> str:
     if lang == 'kh':
         return f'ពាក្យ "{phrase}" អូនមិនប្រាកដ 100% ទេណា 🥺 បើឲ្យប្រយោគពេញ អូនអាចបកប្រែបានច្បាស់ជាងនេះ 💕'
     return f'i am not 100% sure for "{phrase}" alone 🥺 give me the full sentence and i will translate it better 💕'
+
+
+def split_translation_chunks(text: str, max_chars: int) -> list[str]:
+    clean = text.strip()
+    if len(clean) <= max_chars:
+        return [clean]
+
+    parts: list[str] = []
+    blocks = re.split(r'(\n\n+)', clean)
+    current = ''
+
+    for block in blocks:
+        if not block:
+            continue
+        candidate = f'{current}{block}'
+        if len(candidate) <= max_chars:
+            current = candidate
+            continue
+
+        if current.strip():
+            parts.append(current.strip())
+            current = ''
+
+        if len(block) <= max_chars:
+            current = block
+            continue
+
+        sentences = re.split(r'(?<=[.!?។])\s+', block.strip())
+        tmp = ''
+        for s in sentences:
+            c2 = f'{tmp} {s}'.strip()
+            if len(c2) <= max_chars:
+                tmp = c2
+            else:
+                if tmp:
+                    parts.append(tmp)
+                if len(s) <= max_chars:
+                    tmp = s
+                else:
+                    for i in range(0, len(s), max_chars):
+                        parts.append(s[i:i + max_chars].strip())
+                    tmp = ''
+        if tmp:
+            current = tmp
+
+    if current.strip():
+        parts.append(current.strip())
+
+    return [p for p in parts if p]
+
+
+def translate_full_text(payload: str, target_lang: str) -> tuple[str, str]:
+    chunks = split_translation_chunks(payload, TRANSLATE_CHUNK_CHARS)
+    system_instruction = (
+        "You are a professional translator. Translate naturally for real-world daily usage. "
+        "Preserve ALL meaning, tone, numbers, names, and details exactly. "
+        "Translate every sentence completely. Do NOT summarize or shorten. "
+        "Keep paragraph/line structure where possible. Output ONLY translated text."
+    )
+    translated_parts: list[str] = []
+    used_models: list[str] = []
+    many_chunks = len(chunks) > 1
+
+    for idx, chunk in enumerate(chunks, start=1):
+        task = (
+            f"Translate this text to {target_lang}.\n"
+            f"Part {idx}/{len(chunks)}{' of the same long text' if many_chunks else ''}:\n{chunk}"
+        )
+        translated, used_model = generate_task_with_fallback(
+            task,
+            system_instruction,
+            temperature=0.1,
+            max_output_tokens=TRANSLATE_MAX_OUTPUT_TOKENS,
+        )
+        translated_parts.append(clean_ai_output(translated.strip()))
+        used_models.append(used_model)
+
+    merged = '\n\n'.join(p for p in translated_parts if p).strip()
+    model_info = ','.join(sorted(set(used_models))) if used_models else 'unknown'
+    return merged, model_info
 
 
 def message_to_user_text(message) -> str:
@@ -1022,7 +1104,7 @@ def should_use_neari_knowledge(user_text: str, lang: str) -> bool:
     )
     kh_keywords = (
         'អ្វី', 'អី', 'ម៉េច', 'ធ្វើម៉េច', 'ហេតុអី', 'ពន្យល់', 'ប្រៀបធៀប', 'ន័យ', 'ប៉ុន្មាន',
-        'កូដ', 'កំហុស', 'ជួយ', 'គណនា', 'ប្រវត្តិ', 'វិទ្យាសាស្ត្រ',
+        'កូដ', 'កំហុស', 'ជួយ', 'គណនា', 'ប្រវត្តិ', 'វិទ្យាសាស្ត្រ', 'អត្ថន័យ', 'នរណា', 'ទីណា', 'ពេលណា', 'របៀប',
     )
 
     if '?' in text:
@@ -1321,22 +1403,10 @@ def translate_command(message):
 
     src_lang = detect_language_from_text(payload)
     target_lang = 'English' if src_lang == 'kh' else 'Khmer'
-    system_instruction = (
-        "You are a professional translator. Translate naturally for real-world daily usage. "
-        "Preserve all meaning, tone, and details. Do not summarize or shorten. "
-        "Keep paragraphs/line breaks where possible. Output ONLY the translated text."
-    )
-    task = f"Translate this text to {target_lang}:\n{payload}"
-    out_tokens = TRANSLATE_MAX_OUTPUT_TOKENS if len(payload) > 160 or wants_long_response(payload) else 420
 
     try:
         send_typing(message)
-        translated, used_model = generate_task_with_fallback(
-            task,
-            system_instruction,
-            temperature=0.15,
-            max_output_tokens=out_tokens,
-        )
+        translated, used_model = translate_full_text(payload, target_lang)
         logger.info('Chat %s translated using model %s', message.chat.id, used_model)
         send_text(message, translated.strip())
     except Exception as exc:
