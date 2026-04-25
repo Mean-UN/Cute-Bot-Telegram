@@ -3,6 +3,7 @@ import os
 import random
 import re
 import socket
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -138,6 +139,7 @@ user_repeat_count: dict[int, int] = {}
 sulky_until: dict[int, float] = {}
 bot_self_id: int | None = None
 bot_self_username: str = ''
+state_lock = threading.RLock()
 
 model_disabled: set[str] = set()
 model_cooldown_until: dict[str, float] = {}
@@ -229,7 +231,7 @@ def inject_runtime_context(text: str) -> str:
     )
 
 
-def clean_ai_output(text: str) -> str:
+def clean_ai_output(text: str, *, sanitize_markdown: bool = True) -> str:
     t = (text or '').strip()
     if not t:
         return t
@@ -245,14 +247,15 @@ def clean_ai_output(text: str) -> str:
     if t and t[-1] in {'"', "'", '”', '’'} and (len(t) == 1 or t[0] not in {'"', "'", '“', '‘'}):
         t = t[:-1].strip()
 
-    # Remove fenced code blocks while keeping inner content.
-    t = re.sub(r"```[a-zA-Z0-9_-]*\n?", "", t)
-    t = t.replace("```", "")
-    # Remove markdown emphasis markers.
-    t = t.replace("**", "")
-    t = t.replace("__", "")
-    # Normalize accidental markdown headers/bullets spacing.
-    t = re.sub(r"^\s{0,3}#{1,6}\s*", "", t, flags=re.MULTILINE)
+    if sanitize_markdown:
+        # Remove fenced code blocks while keeping inner content.
+        t = re.sub(r"```[a-zA-Z0-9_-]*\n?", "", t)
+        t = t.replace("```", "")
+        # Remove markdown emphasis markers.
+        t = t.replace("**", "")
+        t = t.replace("__", "")
+        # Normalize accidental markdown headers/bullets spacing.
+        t = re.sub(r"^\s{0,3}#{1,6}\s*", "", t, flags=re.MULTILINE)
 
     return t
 
@@ -333,40 +336,58 @@ def detect_language_from_text(text: str) -> str:
     return 'en'
 
 
+def _contains_english_keyword(text_lower: str, keyword: str) -> bool:
+    escaped = re.escape(keyword.lower())
+    pattern = rf'(?<![a-z0-9_]){escaped}(?![a-z0-9_])'
+    return bool(re.search(pattern, text_lower))
+
+
+def _contains_khmer_keyword(text: str, keyword: str) -> bool:
+    return keyword in text
+
+
 def has_shy_trigger(text: str) -> bool:
     low = text.lower()
-    trigger_words = [
+    en_trigger_words = [
         'pretty', 'cute', 'beautiful', 'hot', 'i like you', 'i love you', 'love you',
-        'miss you', 'date', 'kiss', 'adorable', 'sweet girl', 'good girl',
-        'ស្អាត', 'គួរឱ្យស្រឡាញ់', 'cute', 'love', 'ស្រឡាញ់', 'ស្រលាញ់', 'ចូលចិត្ត',
-        'ណាត់', 'kiss', 'ថើប', 'ស្វីត', 'ញ៉ោះ',
+        'miss you', 'date', 'kiss', 'adorable', 'sweet girl', 'good girl', 'love',
     ]
-    return any(w in low for w in trigger_words)
+    kh_trigger_words = ['ស្អាត', 'គួរឱ្យស្រឡាញ់', 'ស្រឡាញ់', 'ស្រលាញ់', 'ចូលចិត្ត', 'ណាត់', 'ថើប', 'ស្វីត', 'ញ៉ោះ']
+    return any(_contains_english_keyword(low, w) for w in en_trigger_words) or any(
+        _contains_khmer_keyword(text, w) for w in kh_trigger_words
+    )
 
 
 def has_sulky_trigger(text: str) -> bool:
     low = text.lower()
-    trigger_words = [
+    en_trigger_words = [
         'where were you', 'why no reply', 'why didnt you reply', 'ignore me',
         'late reply', 'tease', 'just kidding', 'you jealous',
-        'បាត់ទៅណា', 'ហេតុអីមិនឆ្លើយ', 'មិនឆ្លើយ', 'ឌឺ', 'ញ៉ោះ', 'ងរ', 'មិនខ្វល់',
     ]
-    return any(w in low for w in trigger_words)
+    kh_trigger_words = ['បាត់ទៅណា', 'ហេតុអីមិនឆ្លើយ', 'មិនឆ្លើយ', 'ឌឺ', 'ញ៉ោះ', 'ងរ', 'មិនខ្វល់']
+    return any(_contains_english_keyword(low, w) for w in en_trigger_words) or any(
+        _contains_khmer_keyword(text, w) for w in kh_trigger_words
+    )
 
 
 def has_angry_trigger(text: str) -> bool:
     low = text.lower()
-    trigger_words = [
+    en_trigger_words = [
         'stupid', 'idiot', 'dumb', 'shut up', 'bitch', 'hate you', 'fuck you', 'f u',
-        'ល្ងង់', 'ឆ្កួត', 'អាក្រក់', 'ស្អប់', 'មាត់អាក្រក់', 'បិទមាត់', 'ជេរ',
     ]
-    return any(w in low for w in trigger_words)
+    kh_trigger_words = ['ល្ងង់', 'ឆ្កួត', 'អាក្រក់', 'ស្អប់', 'មាត់អាក្រក់', 'បិទមាត់', 'ជេរ']
+    return any(_contains_english_keyword(low, w) for w in en_trigger_words) or any(
+        _contains_khmer_keyword(text, w) for w in kh_trigger_words
+    )
 
 
 def has_snack_bribe(text: str) -> bool:
     low = text.lower()
-    snack_words = ['🍭', '🍰', '🍦', '🍫', '🧋', 'candy', 'cake', 'ice cream', 'snack', 'នំ', 'ស្ករគ្រាប់', 'បង្អែម']
-    return any(w in text for w in ['🍭', '🍰', '🍦', '🍫', '🧋']) or any(w in low for w in snack_words if not any(ch in w for ch in '🍭🍰🍦🍫🧋'))
+    if any(w in text for w in ['🍭', '🍰', '🍦', '🍫', '🧋']):
+        return True
+    en_words = ['candy', 'cake', 'ice cream', 'snack']
+    kh_words = ['នំ', 'ស្ករគ្រាប់', 'បង្អែម']
+    return any(_contains_english_keyword(low, w) for w in en_words) or any(_contains_khmer_keyword(text, w) for w in kh_words)
 
 
 def parse_retry_seconds(error_message: str) -> int:
@@ -523,13 +544,26 @@ def translate_full_text(payload: str, target_lang: str) -> tuple[str, str]:
             f"Translate this text to {target_lang}.\n"
             f"Part {idx}/{len(chunks)}{' of the same long text' if many_chunks else ''}:\n{chunk}"
         )
-        translated, used_model = generate_task_with_fallback(
-            task,
-            system_instruction,
-            temperature=0.1,
-            max_output_tokens=TRANSLATE_MAX_OUTPUT_TOKENS,
-        )
-        translated_parts.append(clean_ai_output(translated.strip()))
+        last_chunk_error = ''
+        translated = ''
+        used_model = ''
+        for _attempt in range(2):
+            try:
+                translated, used_model = generate_task_with_fallback(
+                    task,
+                    system_instruction,
+                    temperature=0.1,
+                    max_output_tokens=TRANSLATE_MAX_OUTPUT_TOKENS,
+                    with_runtime_context=False,
+                    sanitize_markdown=True,
+                )
+                if translated.strip():
+                    break
+            except Exception as exc:
+                last_chunk_error = str(exc)
+        if not translated.strip():
+            raise RuntimeError(f'translate_chunk_failed:{idx}:{last_chunk_error or "empty"}')
+        translated_parts.append(clean_ai_output(translated.strip(), sanitize_markdown=True))
         used_models.append(used_model)
 
     merged = '\n\n'.join(p for p in translated_parts if p).strip()
@@ -584,7 +618,7 @@ def get_bot_identity() -> tuple[int | None, str]:
 
 def has_neari_call(user_text: str) -> bool:
     low = user_text.lower()
-    return 'neari' in low or 'នារី' in user_text
+    return bool(re.search(r'(?<![a-z0-9_])neari(?![a-z0-9_])', low)) or 'នារី' in user_text
 
 
 def is_reply_to_this_bot(message) -> bool:
@@ -669,8 +703,9 @@ def is_broken_reply(text: str) -> bool:
 
 
 def build_prompt(chat_id: int, user_text: str, lang: str) -> str:
-    history = chat_history.get(chat_id, [])
-    mode = chat_mode.get(chat_id, 'cute')
+    with state_lock:
+        history = list(chat_history.get(chat_id, []))
+        mode = chat_mode.get(chat_id, 'cute')
     style_rule = 'Tone mode: ultra-cute and affectionate.' if mode == 'cute' else 'Tone mode: sweet and balanced.'
     shy_rule = (
         'Shy trigger is ON for this message: blush, slight stutter, and playful deflective humor.'
@@ -798,10 +833,10 @@ def call_groq(system_instruction: str, user_content: str, temperature: float, ma
     return ''
 
 
-def generate_with_fallback(prompt: str) -> tuple[str, str]:
+def generate_with_fallback(prompt: str, *, with_runtime_context: bool = True, sanitize_markdown: bool = True) -> tuple[str, str]:
     now = now_ts()
-    prompt_with_context = inject_runtime_context(prompt)
-    system_instruction = inject_runtime_context(BASE_SYSTEM_INSTRUCTION)
+    prompt_with_context = inject_runtime_context(prompt) if with_runtime_context else prompt
+    system_instruction = inject_runtime_context(BASE_SYSTEM_INSTRUCTION) if with_runtime_context else BASE_SYSTEM_INSTRUCTION
 
     last_error = ''
     attempted = False
@@ -827,7 +862,7 @@ def generate_with_fallback(prompt: str) -> tuple[str, str]:
                         "max_output_tokens": CHAT_MAX_OUTPUT_TOKENS,
                     },
                 )
-                text = clean_ai_output((getattr(response, 'text', '') or '').strip())
+                text = clean_ai_output((getattr(response, 'text', '') or '').strip(), sanitize_markdown=sanitize_markdown)
                 if text:
                     return text, f'{model_name}#k{client_idx + 1}'
                 last_error = f'{model_name}:empty_response'
@@ -867,24 +902,24 @@ def generate_with_fallback(prompt: str) -> tuple[str, str]:
         wait = max(1, int(next_ready - now))
         # Try OpenRouter before returning cooldown if available.
         text = call_openrouter(system_instruction, prompt_with_context, temperature=0.9, max_output_tokens=CHAT_MAX_OUTPUT_TOKENS)
-        text = clean_ai_output(text)
+        text = clean_ai_output(text, sanitize_markdown=sanitize_markdown)
         if text:
             return text, f'openrouter:{OPENROUTER_MODEL}'
         # Try Groq before returning cooldown if available.
         text = call_groq(system_instruction, prompt_with_context, temperature=0.9, max_output_tokens=CHAT_MAX_OUTPUT_TOKENS)
-        text = clean_ai_output(text)
+        text = clean_ai_output(text, sanitize_markdown=sanitize_markdown)
         if text:
             return text, f'groq:{GROQ_MODEL}'
         raise RuntimeError(f'models_cooldown:{wait}')
 
     # Gemini attempts failed; try OpenRouter fallback if configured.
     text = call_openrouter(system_instruction, prompt_with_context, temperature=0.9, max_output_tokens=CHAT_MAX_OUTPUT_TOKENS)
-    text = clean_ai_output(text)
+    text = clean_ai_output(text, sanitize_markdown=sanitize_markdown)
     if text:
         return text, f'openrouter:{OPENROUTER_MODEL}'
     # Try Groq fallback if configured.
     text = call_groq(system_instruction, prompt_with_context, temperature=0.9, max_output_tokens=CHAT_MAX_OUTPUT_TOKENS)
-    text = clean_ai_output(text)
+    text = clean_ai_output(text, sanitize_markdown=sanitize_markdown)
     if text:
         return text, f'groq:{GROQ_MODEL}'
     raise RuntimeError(last_error or 'all_models_failed')
@@ -895,10 +930,13 @@ def generate_task_with_fallback(
     system_instruction: str,
     temperature: float = 0.2,
     max_output_tokens: int = 260,
+    *,
+    with_runtime_context: bool = False,
+    sanitize_markdown: bool = True,
 ) -> tuple[str, str]:
     now = now_ts()
-    task_with_context = inject_runtime_context(task_text)
-    system_with_context = inject_runtime_context(system_instruction)
+    task_with_context = inject_runtime_context(task_text) if with_runtime_context else task_text
+    system_with_context = inject_runtime_context(system_instruction) if with_runtime_context else system_instruction
     last_error = ''
     attempted = False
 
@@ -924,7 +962,7 @@ def generate_task_with_fallback(
                         "max_output_tokens": min(max_output_tokens, TASK_MAX_OUTPUT_TOKENS),
                     },
                 )
-                text = clean_ai_output((getattr(response, 'text', '') or '').strip())
+                text = clean_ai_output((getattr(response, 'text', '') or '').strip(), sanitize_markdown=sanitize_markdown)
                 if text:
                     return text, f'{model_name}#k{client_idx + 1}'
                 last_error = f'{model_name}:empty_response'
@@ -956,45 +994,47 @@ def generate_task_with_fallback(
         next_ready = min(next_ready_candidates, default=now + 15)
         wait = max(1, int(next_ready - now))
         text = call_openrouter(system_with_context, task_with_context, temperature=temperature, max_output_tokens=min(max_output_tokens, TASK_MAX_OUTPUT_TOKENS))
-        text = clean_ai_output(text)
+        text = clean_ai_output(text, sanitize_markdown=sanitize_markdown)
         if text:
             return text, f'openrouter:{OPENROUTER_MODEL}'
         text = call_groq(system_with_context, task_with_context, temperature=temperature, max_output_tokens=min(max_output_tokens, TASK_MAX_OUTPUT_TOKENS))
-        text = clean_ai_output(text)
+        text = clean_ai_output(text, sanitize_markdown=sanitize_markdown)
         if text:
             return text, f'groq:{GROQ_MODEL}'
         raise RuntimeError(f'models_cooldown:{wait}')
 
     text = call_openrouter(system_with_context, task_with_context, temperature=temperature, max_output_tokens=min(max_output_tokens, TASK_MAX_OUTPUT_TOKENS))
-    text = clean_ai_output(text)
+    text = clean_ai_output(text, sanitize_markdown=sanitize_markdown)
     if text:
         return text, f'openrouter:{OPENROUTER_MODEL}'
     text = call_groq(system_with_context, task_with_context, temperature=temperature, max_output_tokens=min(max_output_tokens, TASK_MAX_OUTPUT_TOKENS))
-    text = clean_ai_output(text)
+    text = clean_ai_output(text, sanitize_markdown=sanitize_markdown)
     if text:
         return text, f'groq:{GROQ_MODEL}'
     raise RuntimeError(last_error or 'all_models_failed')
 
 
 def save_turn(chat_id: int, user_text: str, assistant_text: str) -> None:
-    history = chat_history.setdefault(chat_id, [])
-    history.append(('User', user_text))
-    history.append(('Assistant', assistant_text))
-
-    if len(history) > MEMORY_LIMIT * 2:
-        chat_history[chat_id] = history[-MEMORY_LIMIT * 2 :]
+    with state_lock:
+        history = chat_history.setdefault(chat_id, [])
+        history.append(('User', user_text))
+        history.append(('Assistant', assistant_text))
+        if len(history) > MEMORY_LIMIT * 2:
+            chat_history[chat_id] = history[-MEMORY_LIMIT * 2 :]
 
 
 def save_ai_turn(chat_id: int, user_text: str, assistant_text: str) -> None:
-    history = ai_history.setdefault(chat_id, [])
-    history.append(('User', user_text))
-    history.append(('Assistant', assistant_text))
-    if len(history) > AI_MEMORY_LIMIT * 2:
-        ai_history[chat_id] = history[-AI_MEMORY_LIMIT * 2 :]
+    with state_lock:
+        history = ai_history.setdefault(chat_id, [])
+        history.append(('User', user_text))
+        history.append(('Assistant', assistant_text))
+        if len(history) > AI_MEMORY_LIMIT * 2:
+            ai_history[chat_id] = history[-AI_MEMORY_LIMIT * 2 :]
 
 
 def build_ai_task(chat_id: int, payload: str) -> str:
-    history = ai_history.get(chat_id, [])
+    with state_lock:
+        history = list(ai_history.get(chat_id, []))
     lines = [
         "Continue this same AI conversation and keep context from previous turns.",
         "If user asks a new topic, answer it normally.",
@@ -1065,6 +1105,8 @@ def run_ai_mode(message, payload: str) -> None:
             system_instruction,
             temperature=0.35,
             max_output_tokens=output_tokens,
+            with_runtime_context=True,
+            sanitize_markdown=False,
         )
         answer = answer.strip()
         save_ai_turn(chat_id, payload, answer)
@@ -1118,6 +1160,12 @@ def should_use_neari_knowledge(user_text: str, lang: str) -> bool:
     return False
 
 
+def wants_code_format(user_text: str) -> bool:
+    low = (user_text or '').lower()
+    code_hints = ['code', 'python', 'javascript', 'java', 'c++', 'c#', 'sql', 'api', 'json', 'regex', 'script']
+    return any(_contains_english_keyword(low, k) for k in code_hints) or 'កូដ' in user_text
+
+
 def generate_neari_knowledge_reply(user_text: str, lang: str) -> tuple[str, str]:
     system_instruction = (
         "You are Neari (នារី), a friendly and cute assistant with accurate knowledge. "
@@ -1138,8 +1186,10 @@ def generate_neari_knowledge_reply(user_text: str, lang: str) -> tuple[str, str]
         system_instruction,
         temperature=0.25,
         max_output_tokens=output_tokens,
+        with_runtime_context=True,
+        sanitize_markdown=not wants_code_format(user_text),
     )
-    answer = clean_ai_output(answer.strip())
+    answer = clean_ai_output(answer.strip(), sanitize_markdown=not wants_code_format(user_text))
     if lang == 'kh':
         answer = enforce_khmer_reply(answer, user_text)
     answer = ensure_cute_emoji(answer, lang, user_text)
@@ -1209,9 +1259,12 @@ def generate_emotion_reply(chat_id: int, user_text: str, lang: str, mood: str, r
 def fast_emotion_reply(chat_id: int, message, user_text: str, lang: str) -> str:
     low = user_text.lower()
     now = now_ts()
+    with state_lock:
+        in_sulky = sulky_until.get(chat_id, 0) > now
 
-    if has_snack_bribe(user_text) and sulky_until.get(chat_id, 0) > now:
-        sulky_until[chat_id] = 0
+    if has_snack_bribe(user_text) and in_sulky:
+        with state_lock:
+            sulky_until[chat_id] = 0
         if lang == 'kh':
             return random.choice([
                 'ហិហិ មាននំឲ្យនារីមែន? 🍭 អូខេ អូនបាត់ងរហើយណា 🎀✨',
@@ -1223,7 +1276,8 @@ def fast_emotion_reply(chat_id: int, message, user_text: str, lang: str) -> str:
         ])
 
     if has_angry_trigger(low):
-        sulky_until[chat_id] = now + SULKY_HOLD_SECONDS
+        with state_lock:
+            sulky_until[chat_id] = now + SULKY_HOLD_SECONDS
         if lang == 'kh':
             return random.choice([
                 'កុំនិយាយបែបនោះដាក់នារី 😠 នារីក៏មានអារម្មណ៍ដែរ 👊💢',
@@ -1235,7 +1289,8 @@ def fast_emotion_reply(chat_id: int, message, user_text: str, lang: str) -> str:
         ])
 
     if has_sulky_trigger(low):
-        sulky_until[chat_id] = now + SULKY_HOLD_SECONDS
+        with state_lock:
+            sulky_until[chat_id] = now + SULKY_HOLD_SECONDS
         if lang == 'kh':
             return random.choice([
                 'ហឹម... នារីងរបន្តិចសិន 😒💨',
@@ -1246,7 +1301,7 @@ def fast_emotion_reply(chat_id: int, message, user_text: str, lang: str) -> str:
             "go ask someone else 🙄 i don't know.",
         ])
 
-    if sulky_until.get(chat_id, 0) > now and message.content_type in {'sticker', 'text'}:
+    if in_sulky and message.content_type in {'sticker', 'text'}:
         if lang == 'kh':
             return random.choice(['ហឹម... មិនទាន់បាត់ងរទេ 😒', 'ឲ្យអូនស្ងប់ចិត្តបន្តិចសិន 🙄💨'])
         return random.choice(['hmm... still sulking 😒', 'give me a moment 🙄💨'])
@@ -1356,32 +1411,33 @@ def set_mode(message):
 @bot.message_handler(commands=['reset'])
 def reset_chat(message):
     chat_id = message.chat.id
-    chat_history.pop(chat_id, None)
-    ai_history.pop(chat_id, None)
-    last_user_seen_at.pop(chat_id, None)
-    last_user_signature.pop(chat_id, None)
-    user_repeat_count.pop(chat_id, None)
-    sulky_until.pop(chat_id, None)
+    with state_lock:
+        chat_history.pop(chat_id, None)
+        ai_history.pop(chat_id, None)
+        last_user_seen_at.pop(chat_id, None)
+        last_user_signature.pop(chat_id, None)
+        user_repeat_count.pop(chat_id, None)
+        sulky_until.pop(chat_id, None)
     send_text(message, 'chat memory reset done ✨')
 
 
 @bot.message_handler(commands=['status'])
 def status(message):
-    lang = 'en'
     now = now_ts()
-    waits = []
-    for client_idx, _client in enumerate(clients):
-        for m in MODEL_CANDIDATES:
-            if m in model_disabled:
-                continue
-            waits.append(max(0, int(model_cooldown_until.get(key_model_id(client_idx, m), 0) - now)))
-    wait = max(waits) if waits else 0
-    disabled = ', '.join(sorted(model_disabled)) if model_disabled else 'none'
-    disabled_keys = ', '.join(f'k{i + 1}' for i in sorted(gemini_disabled_clients)) if gemini_disabled_clients else 'none'
-    provider_state = (
-        f'openrouter={"disabled" if openrouter_disabled else "enabled"}, '
-        f'groq={"disabled" if groq_disabled else "enabled"}'
-    )
+    with state_lock:
+        waits = []
+        for client_idx, _client in enumerate(clients):
+            for m in MODEL_CANDIDATES:
+                if m in model_disabled:
+                    continue
+                waits.append(max(0, int(model_cooldown_until.get(key_model_id(client_idx, m), 0) - now)))
+        wait = max(waits) if waits else 0
+        disabled = ', '.join(sorted(model_disabled)) if model_disabled else 'none'
+        disabled_keys = ', '.join(f'k{i + 1}' for i in sorted(gemini_disabled_clients)) if gemini_disabled_clients else 'none'
+        provider_state = (
+            f'openrouter={"disabled" if openrouter_disabled else "enabled"}, '
+            f'groq={"disabled" if groq_disabled else "enabled"}'
+        )
     if wait > 0:
         send_text(
             message,
@@ -1410,7 +1466,12 @@ def translate_command(message):
         logger.info('Chat %s translated using model %s', message.chat.id, used_model)
         send_text(message, translated.strip())
     except Exception as exc:
-        logger.error('Translate command failed for chat %s: %s', message.chat.id, exc)
+        msg = str(exc)
+        logger.error('Translate command failed for chat %s: %s', message.chat.id, msg)
+        if msg.startswith('translate_chunk_failed:'):
+            chunk_no = msg.split(':', 2)[1]
+            send_text(message, f'Translate failed at part {chunk_no}. Please retry /tr once more.')
+            return
         send_text(message, 'Translate is temporarily unavailable right now. Please try again in a bit.')
 
 
@@ -1472,19 +1533,22 @@ def reply(message):
     now = now_ts()
 
     signature = message_signature(message, user_text)
-    if last_user_signature.get(chat_id) == signature:
-        user_repeat_count[chat_id] = user_repeat_count.get(chat_id, 1) + 1
-    else:
-        user_repeat_count[chat_id] = 1
-    last_user_signature[chat_id] = signature
+    with state_lock:
+        if last_user_signature.get(chat_id) == signature:
+            user_repeat_count[chat_id] = user_repeat_count.get(chat_id, 1) + 1
+        else:
+            user_repeat_count[chat_id] = 1
+        last_user_signature[chat_id] = signature
 
-    inactive_seconds = 0
-    if chat_id in last_user_seen_at:
-        inactive_seconds = int(now - last_user_seen_at[chat_id])
-    last_user_seen_at[chat_id] = now
+        inactive_seconds = 0
+        if chat_id in last_user_seen_at:
+            inactive_seconds = int(now - last_user_seen_at[chat_id])
+        last_user_seen_at[chat_id] = now
+        repeat_count = user_repeat_count.get(chat_id, 1)
 
     if inactive_seconds >= SULKY_INACTIVE_SECONDS and not has_snack_bribe(user_text):
-        sulky_until[chat_id] = now + SULKY_HOLD_SECONDS
+        with state_lock:
+            sulky_until[chat_id] = now + SULKY_HOLD_SECONDS
         reply_text = generate_emotion_reply(
             chat_id,
             user_text,
@@ -1495,8 +1559,9 @@ def reply(message):
         send_text(message, reply_text)
         return
 
-    if message.content_type == 'sticker' and user_repeat_count.get(chat_id, 1) >= 2:
-        sulky_until[chat_id] = now + SULKY_HOLD_SECONDS
+    if message.content_type == 'sticker' and repeat_count >= 2:
+        with state_lock:
+            sulky_until[chat_id] = now + SULKY_HOLD_SECONDS
         reply_text = generate_emotion_reply(
             chat_id,
             user_text,
@@ -1507,8 +1572,9 @@ def reply(message):
         send_text(message, reply_text)
         return
 
-    if message.content_type == 'text' and user_repeat_count.get(chat_id, 1) >= 3 and len(user_text.strip()) <= 40:
-        sulky_until[chat_id] = now + SULKY_HOLD_SECONDS
+    if message.content_type == 'text' and repeat_count >= 3 and len(user_text.strip()) <= 40:
+        with state_lock:
+            sulky_until[chat_id] = now + SULKY_HOLD_SECONDS
         reply_text = generate_emotion_reply(
             chat_id,
             user_text,
@@ -1564,7 +1630,7 @@ def reply(message):
 if __name__ == '__main__':
     while True:
         try:
-            bot.infinity_polling(timeout=20, long_polling_timeout=20)
+            bot.infinity_polling(timeout=20, long_polling_timeout=20, threaded=False)
         except KeyboardInterrupt:
             logger.info("Bot stopped by user (Ctrl+C).")
             break
