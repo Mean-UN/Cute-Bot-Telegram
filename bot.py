@@ -1630,7 +1630,7 @@ def reply(message):
 if __name__ == '__main__':
     while True:
         try:
-            bot.infinity_polling(timeout=20, long_polling_timeout=20, threaded=False)
+            bot.infinity_polling(timeout=20, long_polling_timeout=20)
         except KeyboardInterrupt:
             logger.info("Bot stopped by user (Ctrl+C).")
             break
