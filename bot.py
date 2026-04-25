@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 from google import genai
 import requests
 from requests.exceptions import RequestException
+from core import triggers as trigger_utils
 
 ENV_PATH = Path(__file__).resolve().with_name('.env')
 load_dotenv(dotenv_path=ENV_PATH, override=True)
@@ -336,58 +337,20 @@ def detect_language_from_text(text: str) -> str:
     return 'en'
 
 
-def _contains_english_keyword(text_lower: str, keyword: str) -> bool:
-    escaped = re.escape(keyword.lower())
-    pattern = rf'(?<![a-z0-9_]){escaped}(?![a-z0-9_])'
-    return bool(re.search(pattern, text_lower))
-
-
-def _contains_khmer_keyword(text: str, keyword: str) -> bool:
-    return keyword in text
-
-
 def has_shy_trigger(text: str) -> bool:
-    low = text.lower()
-    en_trigger_words = [
-        'pretty', 'cute', 'beautiful', 'hot', 'i like you', 'i love you', 'love you',
-        'miss you', 'date', 'kiss', 'adorable', 'sweet girl', 'good girl', 'love',
-    ]
-    kh_trigger_words = ['ស្អាត', 'គួរឱ្យស្រឡាញ់', 'ស្រឡាញ់', 'ស្រលាញ់', 'ចូលចិត្ត', 'ណាត់', 'ថើប', 'ស្វីត', 'ញ៉ោះ']
-    return any(_contains_english_keyword(low, w) for w in en_trigger_words) or any(
-        _contains_khmer_keyword(text, w) for w in kh_trigger_words
-    )
+    return trigger_utils.has_shy_trigger(text)
 
 
 def has_sulky_trigger(text: str) -> bool:
-    low = text.lower()
-    en_trigger_words = [
-        'where were you', 'why no reply', 'why didnt you reply', 'ignore me',
-        'late reply', 'tease', 'just kidding', 'you jealous',
-    ]
-    kh_trigger_words = ['បាត់ទៅណា', 'ហេតុអីមិនឆ្លើយ', 'មិនឆ្លើយ', 'ឌឺ', 'ញ៉ោះ', 'ងរ', 'មិនខ្វល់']
-    return any(_contains_english_keyword(low, w) for w in en_trigger_words) or any(
-        _contains_khmer_keyword(text, w) for w in kh_trigger_words
-    )
+    return trigger_utils.has_sulky_trigger(text)
 
 
 def has_angry_trigger(text: str) -> bool:
-    low = text.lower()
-    en_trigger_words = [
-        'stupid', 'idiot', 'dumb', 'shut up', 'bitch', 'hate you', 'fuck you', 'f u',
-    ]
-    kh_trigger_words = ['ល្ងង់', 'ឆ្កួត', 'អាក្រក់', 'ស្អប់', 'មាត់អាក្រក់', 'បិទមាត់', 'ជេរ']
-    return any(_contains_english_keyword(low, w) for w in en_trigger_words) or any(
-        _contains_khmer_keyword(text, w) for w in kh_trigger_words
-    )
+    return trigger_utils.has_angry_trigger(text)
 
 
 def has_snack_bribe(text: str) -> bool:
-    low = text.lower()
-    if any(w in text for w in ['🍭', '🍰', '🍦', '🍫', '🧋']):
-        return True
-    en_words = ['candy', 'cake', 'ice cream', 'snack']
-    kh_words = ['នំ', 'ស្ករគ្រាប់', 'បង្អែម']
-    return any(_contains_english_keyword(low, w) for w in en_words) or any(_contains_khmer_keyword(text, w) for w in kh_words)
+    return trigger_utils.has_snack_bribe(text)
 
 
 def parse_retry_seconds(error_message: str) -> int:
@@ -542,7 +505,9 @@ def translate_full_text(payload: str, target_lang: str) -> tuple[str, str]:
     for idx, chunk in enumerate(chunks, start=1):
         task = (
             f"Translate this text to {target_lang}.\n"
-            f"Part {idx}/{len(chunks)}{' of the same long text' if many_chunks else ''}:\n{chunk}"
+            "Output translated content only (no labels, no headers, no 'Part x/y').\n"
+            f"Context index {idx}/{len(chunks)}{' of the same long text' if many_chunks else ''}.\n"
+            f"Text:\n{chunk}"
         )
         last_chunk_error = ''
         translated = ''
@@ -563,7 +528,10 @@ def translate_full_text(payload: str, target_lang: str) -> tuple[str, str]:
                 last_chunk_error = str(exc)
         if not translated.strip():
             raise RuntimeError(f'translate_chunk_failed:{idx}:{last_chunk_error or "empty"}')
-        translated_parts.append(clean_ai_output(translated.strip(), sanitize_markdown=True))
+        cleaned = clean_ai_output(translated.strip(), sanitize_markdown=True)
+        # Safety cleanup: some models still prepend labels like "Part 1/1:" or "ផ្នែក 1/1:"
+        cleaned = re.sub(r'^\s*(?:part|section|chunk|ផ្នែក)\s*\d+\s*/\s*\d+\s*[:៖-]\s*', '', cleaned, flags=re.IGNORECASE)
+        translated_parts.append(cleaned.strip())
         used_models.append(used_model)
 
     merged = '\n\n'.join(p for p in translated_parts if p).strip()
@@ -617,8 +585,7 @@ def get_bot_identity() -> tuple[int | None, str]:
 
 
 def has_neari_call(user_text: str) -> bool:
-    low = user_text.lower()
-    return bool(re.search(r'(?<![a-z0-9_])neari(?![a-z0-9_])', low)) or 'នារី' in user_text
+    return trigger_utils.has_neari_call(user_text)
 
 
 def is_reply_to_this_bot(message) -> bool:
@@ -1163,7 +1130,7 @@ def should_use_neari_knowledge(user_text: str, lang: str) -> bool:
 def wants_code_format(user_text: str) -> bool:
     low = (user_text or '').lower()
     code_hints = ['code', 'python', 'javascript', 'java', 'c++', 'c#', 'sql', 'api', 'json', 'regex', 'script']
-    return any(_contains_english_keyword(low, k) for k in code_hints) or 'កូដ' in user_text
+    return any(trigger_utils.contains_english_keyword(low, k) for k in code_hints) or 'កូដ' in user_text
 
 
 def generate_neari_knowledge_reply(user_text: str, lang: str) -> tuple[str, str]:
